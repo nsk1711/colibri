@@ -24,6 +24,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Performance
 
+- **CUDA decode: a selection list's attention split over its positions, int8 rows four outputs a
+  warp.** A decode step's or a verify's rows with a selection list per row (Qwen3.8's QSA) went
+  through one block per (head, row) walking every selected position; they now take the blocks
+  of positions the plain attention takes (1.56 -> 0.41 ms of a Qwen3.8-Flash-Next verify on an
+  RTX PRO 4000). The int8 GEMV of a decode step's or a verify's rows reads each lane's slice of x
+  once for four outputs, the inputs split where the outputs are few (the hyper-connection read,
+  10240 x 320 at four rows: 15.1 -> 9.0 us alone). `COLI_CUDA_ATTN_DEC_SEL`, `COLI_CUDA_GEMV_W4`,
+  `COLI_CUDA_GEMV_SK`.
 - **Qwen3.8's CUDA and Vulkan chains: a short prompt's host pool experts on the CPU.** A prompt chunk copied
   every pooled expert of every layer over the bus, routed or not (18 GB for any prompt up to
   2048 tokens on Qwen3.8-Flash-Next IQ2_XS with an RTX PRO 4000). A prompt of one chunk now has
