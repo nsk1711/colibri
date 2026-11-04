@@ -17,6 +17,8 @@
 #include "../backend_gpu_compat.h"   /* the runtime's names under HIP too (the planar blocks' host memory) */
 #define COLI_CUDA_CHAIN_NO_WRAPPERS
 #include "../cuda_chain.h"
+#define KV16_INTEGER   /* kv16.h's integer rounding: the reference of ew's CC_EW_F16 */
+#include "../kv16.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,6 +50,31 @@ static void ref_rope(float *x, const float *cs, const CcRope *p) {
         int row = seg / p->per_row, hh = seg - row * p->per_row;
         float *base = x + p->x_off + row * p->x_row + hh * p->x_seg; const float *cb = cs + p->cs_off + row * p->cs_row;
         for (int j = 0; j < p->half_; j++) { float c = cb[2 * j], s = cb[2 * j + 1], a = base[j], b = base[j + p->half_]; base[j] = a * c - b * s; base[j + p->half_] = b * c + a * s; }
+    }
+}
+/* ref_attn with a sliding window of win positions (0: all), a sink logit per head
+ * (snk[sink_off + h], NULL: none) and a ring of `ring` rows (position t in row t % ring; 0: none) */
+static void ref_attn_w(const float *q, const float *kc, const float *vc, float *o, const CcAttn *p, int win, const float *snk,
+                       int sink_off, int ring) {
+    int rep = p->H / p->KVH;
+    std::vector<float> sv((size_t)p->pos_base + p->S);
+    for (int s = 0; s < p->S; s++) for (int h = 0; h < p->H; h++) {
+        int kvh = h / rep, pos = p->pos_base + s, lo = win > 0 && pos - win + 1 > 0 ? pos - win + 1 : 0;
+        const float *qs = q + p->q_off + s * p->q_row + h * p->q_seg;
+        float m = snk ? snk[sink_off + h] : -3.0e38f;
+        for (int t = lo; t <= pos; t++) {
+            const float *kb = kc + p->k_off + (size_t)(kvh * p->cap + (ring ? t % ring : t)) * p->hd; float a = 0.f;
+            for (int d = 0; d < p->hd; d++) a += qs[d] * kb[d];
+            sv[t] = a * p->scale; if (sv[t] > m) m = sv[t];
+        }
+        double l = snk ? exp((double)snk[sink_off + h] - m) : 0.0, acc[256] = {0};
+        for (int t = lo; t <= pos; t++) {
+            double e = exp((double)sv[t] - m); l += e;
+            const float *vb = vc + p->v_off + (size_t)(kvh * p->cap + (ring ? t % ring : t)) * p->hd;
+            for (int d = 0; d < p->hd; d++) acc[d] += e * vb[d];
+        }
+        float *ob = o + p->o_off + s * p->o_row + h * p->hd;
+        for (int d = 0; d < p->hd; d++) ob[d] = (float)(acc[d] / l);
     }
 }
 static void ref_attn(const float *q, const float *kc, const float *vc, float *o, const float *gate, const int *sel, const CcAttn *p) {
@@ -307,6 +334,44 @@ static ColiCudaTensor *moe_mat(int fmt, int gs, int I, int O, unsigned seed, std
     return ok ? t : NULL;
 }
 
+/* COLI_CUDA_CHAIN_BENCH=adec: one decode row's attention over L = 10 layers of caches of their
+ * own, float16 (attn_h; COLI_CUDA_BENCH_KV16=0 float32), COLI_CUDA_BENCH_ADEC "H KVH hd pos"
+ * (Qwen3.6's 16 2 256 18000 by default): the time a layer, the best of five frames */
+static void bench_adec(void) {
+    int H = 16, KVH = 2, hd = 256, pos = 18000, n = 10;
+    const char *sh = getenv("COLI_CUDA_BENCH_ADEC"), *k16 = getenv("COLI_CUDA_BENCH_KV16");
+    if (sh && *sh) sscanf(sh, "%d %d %d %d", &H, &KVH, &hd, &pos);
+    int h16 = !(k16 && *k16 == '0') && T->size >= offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h && T->kvh();
+    size_t kv = (size_t)KVH * (pos + 1) * hd;
+    std::vector<float> q = rnd((size_t)H * hd, 5), k = rnd(kv, 6);
+    std::vector<uint16_t> kh(kv);
+    kv16_round(k.data(), (int64_t)kv); kv16_pack(kh.data(), k.data(), (int64_t)kv);
+    CcBuf *qb = up(q), *ob = T->buf((size_t)H * hd * 4, CC_DEV), *kb[10], *vb[10];
+    int ok = qb && ob;
+    for (int l = 0; l < n; l++) {
+        kb[l] = T->buf(kv * (h16 ? 2 : 4), CC_DEV); vb[l] = T->buf(kv * (h16 ? 2 : 4), CC_DEV);
+        ok = ok && kb[l] && vb[l] && T->begin() && T->write(kb[l], 0, h16 ? (const void *)kh.data() : (const void *)k.data(), kv * (h16 ? 2 : 4)) &&
+             T->write(vb[l], 0, h16 ? (const void *)kh.data() : (const void *)k.data(), kv * (h16 ? 2 : 4)) && T->submit(1);
+    }
+    double best = 1e9;
+    for (int r = 0; r < 5 && ok; r++) {
+        ok = T->begin();
+        for (int l = 0; l < n && ok; l++) {
+            CcAttn a = {1, H, KVH, hd, pos, pos + 1, 0, H * hd, hd, 0, 0, 0, 0, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), 0, 0};
+            ok = h16 ? T->attn_h(qb, kb[l], vb[l], ob, NULL, NULL, &a) : T->attn(qb, kb[l], vb[l], ob, NULL, NULL, &a);
+        }
+        auto t0 = std::chrono::steady_clock::now();
+        ok = T->submit(1) && ok;
+        double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (dt < best) best = dt;
+    }
+    if (ok) printf("bench adec H %d/%d hd %d at %d positions%s: %.1f us a layer (%.1f GB/s of K and V)\n", H, KVH, hd, pos,
+                   h16 ? ", float16" : "", best * 1e6 / n, 2.0 * kv * (h16 ? 2 : 4) * n / best / 1e9);
+    else printf("bench adec: the frame failed\n");
+    for (int l = 0; l < n; l++) { T->free(kb[l]); T->free(vb[l]); }
+    T->free(qb); T->free(ob);
+}
+
 int main(void) {
     int dev = 0;
     if (!coli_cuda_init(&dev, 1)) { printf("no CUDA device: skipped\n"); return 0; }
@@ -315,6 +380,8 @@ int main(void) {
     if (!T) return 1;
     ck(T->init(0), "a context on device 0");
     ck(T->ready() && !T->lost(), "ready, not lost");
+    const char *be = getenv("COLI_CUDA_CHAIN_BENCH");
+    if (be && !strcmp(be, "adec")) { bench_adec(); return 0; }
 
     printf("buffers and frames\n");
     {
@@ -335,22 +402,27 @@ int main(void) {
         ck(T->reserve(&r, 64, CC_DEV) && T->bytes(r) >= 64 && T->reserve(&r, 32, CC_DEV) && T->bytes(r) >= 64 && T->reserve(&r, 4096, CC_DEV) && T->bytes(r) >= 4096, "reserve grows, never shrinks");
         T->free(d); T->free(u); T->free(dn); T->free(d2); T->free(r);
     }
-    {   /* a prompt chunk's K rows into a head-major cache: a region per row and head, one kernel for
-         * the grid (64 regions or more); off the grid, the copies as before */
-        const int S = 100, H = 4, hd = 32, DR = 256, pb = 7;
-        for (int shuffle = 0; shuffle < 2; shuffle++) {
-            std::vector<float> src = rnd((size_t)S * H * hd, 61 + shuffle), dst = rnd((size_t)H * DR * hd, 63);
-            std::vector<CcRegion> rg((size_t)S * H);
-            for (int s = 0; s < S; s++) for (int h = 0; h < H; h++)
-                rg[(size_t)s * H + h] = {((size_t)h * DR + pb + s) * hd, (size_t)s * H * hd + (size_t)h * hd, (size_t)hd};
-            if (shuffle) std::swap(rg[0], rg[(size_t)S * H - 1]);
-            std::vector<float> want = dst;
-            for (auto &x : rg) memcpy(want.data() + x.dst, src.data() + x.src, x.n * 4);
-            CcBuf *sb = up(src), *db = up(dst);
-            ck(T->begin() && T->copy_regions(db, sb, rg.data(), (int)rg.size()) && T->submit(1) &&
-               maxdiff(down(db, dst.size()).data(), want.data(), dst.size()) == 0,
-               shuffle ? "400 regions off the grid: a copy each" : "400 regions on a grid: one kernel");
-            T->free(sb); T->free(db);
+    {   /* K rows into a head-major cache: a region per row and head, one kernel for the grid
+         * (two regions or more, from a decode step's KV heads up to a prompt chunk); off the
+         * grid, the copies as before */
+        for (int S : {1, 2, 100}) {
+            const int H = S < 10 ? 2 : 4, hd = 32, DR = 256, pb = 7;
+            for (int shuffle = 0; shuffle < (S == 100 ? 2 : 1); shuffle++) {
+                std::vector<float> src = rnd((size_t)S * H * hd, 61 + S + shuffle), dst = rnd((size_t)H * DR * hd, 63);
+                std::vector<CcRegion> rg((size_t)S * H);
+                for (int s = 0; s < S; s++) for (int h = 0; h < H; h++)
+                    rg[(size_t)s * H + h] = {((size_t)h * DR + pb + s) * hd, (size_t)s * H * hd + (size_t)h * hd, (size_t)hd};
+                if (shuffle) std::swap(rg[0], rg[(size_t)S * H - 1]);
+                std::vector<float> want = dst;
+                for (auto &x : rg) memcpy(want.data() + x.dst, src.data() + x.src, x.n * 4);
+                CcBuf *sb = up(src), *db = up(dst);
+                ck(T->begin() && T->copy_regions(db, sb, rg.data(), (int)rg.size()) && T->submit(1) &&
+                   maxdiff(down(db, dst.size()).data(), want.data(), dst.size()) == 0,
+                   shuffle ? "400 regions off the grid: a copy each" :
+                   S == 1 ? "2 regions on a grid (decode KV): one kernel" :
+                   S == 2 ? "4 regions on a grid (verify KV): one kernel" : "400 regions on a grid: one kernel");
+                T->free(sb); T->free(db);
+            }
         }
     }
     if (T->size >= offsetof(ColiCudaChainOps, host_up_done) + sizeof T->host_up_done) {
@@ -498,6 +570,42 @@ int main(void) {
         ck(T->begin() && T->rope(xb, cb, &p) && T->submit(1) && maxdiff(down(xb, x.size()).data(), ref.data(), x.size()) < 1e-5, "rotate-half from the host's table");
         T->free(xb); T->free(cb);
     }
+    printf("float16 KV rows\n");
+    {
+        /* ew's CC_EW_F16 against kv16.h, every bit: ordinary values, past +-65504 (clamped), and
+         * small ones down through float16's subnormals to zero */
+        const int n = 4096;
+        std::vector<float> x = rnd(n, 51, 70000.f);
+        for (int i = 0; i < n / 4; i++) x[i] *= 1e-4f;
+        for (int i = n / 4; i < n / 2; i++) x[i] *= 1e-9f;
+        CcEw r = {CC_EW_F16, n, n, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
+        CcBuf *xb = up(x), *yb = up(std::vector<float>(n));
+        int ok = T->begin() && T->ew(yb, xb, NULL, NULL, NULL, &r) && T->submit(1), bad = 0;
+        std::vector<float> y = down(yb, n);
+        for (int i = 0; i < n && ok; i++) {
+            float c = kv16_clamp(x[i]); uint32_t cu, want, got; memcpy(&cu, &c, 4); want = kv16_round_bits(cu); memcpy(&got, &y[i], 4);
+            bad += got != want;
+        }
+        ck(ok && !bad, "ew's float16 rounding: the bits of kv16.h's");
+        T->free(xb); T->free(yb);
+        /* rope_f16: the rope and both rounds in one launch, the bits of the three launches; a
+         * partial rotation (16 of 40 values a head), as Qwen3.6's 64 of 256 */
+        if (T->size >= offsetof(ColiCudaChainOps, rope_f16) + sizeof T->rope_f16 && T->rope_f16) {
+            const int rows = 3, KV = 2, kvd = 40, half = 8;
+            std::vector<float> k = rnd((size_t)rows * KV * kvd, 61, 3.f), v = rnd((size_t)rows * KV * kvd, 62, 3.f), cs((size_t)rows * 2 * half);
+            for (int q = 0; q < rows; q++) for (int j = 0; j < half; j++) { float ang = (q + 7) * powf(10000.f, -2.f * j / (2 * half)); cs[(q * half + j) * 2] = cosf(ang); cs[(q * half + j) * 2 + 1] = sinf(ang); }
+            CcRope p = {rows * KV, KV, 0, KV * kvd, kvd, half, 0, 2 * half};
+            CcEw rr = {CC_EW_F16, rows * KV * kvd, KV * kvd, 0, 0, 0, 0, 0, 0, 0, 0, 1.f};
+            CcBuf *k3 = up(k), *v3 = up(v), *k1 = up(k), *v1 = up(v), *cb = up(cs, CC_UP);
+            int three = T->begin() && T->rope(k3, cb, &p) && T->ew(k3, k3, NULL, NULL, NULL, &rr) && T->ew(v3, v3, NULL, NULL, NULL, &rr) && T->submit(1);
+            int one = T->begin() && T->rope_f16(k1, v1, cb, &p, kvd) && T->submit(1);
+            std::vector<float> ka = down(k3, k.size()), kb = down(k1, k.size()), va = down(v3, v.size()), vb = down(v1, v.size());
+            ck(three && one && !memcmp(ka.data(), kb.data(), k.size() * 4) && !memcmp(va.data(), vb.data(), v.size() * 4),
+               "rope_f16: K rotated and rounded, V rounded, the bits of rope and two ew");
+            ck(!T->rope_f16(k1, v1, cb, &p, 2 * half - 1), "rope_f16: a segment narrower than the rotation refused");
+            T->free(k3); T->free(v3); T->free(k1); T->free(v1); T->free(cb);
+        } else ck(0, "the backend has rope_f16");
+    }
     printf("attn\n");
     {
         const int H = 4, KV = 2, hd = 32, qdim = 2 * hd, cap = 300, pos_base = 140, S = 5, k_off = 64;
@@ -569,6 +677,122 @@ int main(void) {
             ck(d < 4e-3f, what);
             printf("  %s: max |diff| %.2e\n", what, d);
             T->free(qb); T->free(kb); T->free(vb); T->free(ob);
+        }
+    }
+    {   /* a prompt chunk with a sliding window and a sink per head (Flint), its cache linear or a
+         * ring: the tensor cores where the device has them (within 4e-3 of the reference) */
+        struct { int H, KV, hd, S, pos_base, win, ring; } cs[] = {{32, 4, 128, 300, 700, 129, 0}, {32, 4, 128, 90, 900, 129, 230},
+                                                                  {16, 2, 256, 70, 300, 100, 0}, {8, 8, 64, 33, 0, 20, 0},
+                                                                  {32, 4, 128, 200, 0, 513, 0}};
+        for (auto &k : cs) {
+            const int cap = k.ring ? k.ring : k.pos_base + k.S + 9, k_off = 32, so = 3;
+            std::vector<float> q = rnd((size_t)k.S * k.H * k.hd, 71), kc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 72),
+                               vc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 73), sk = rnd((size_t)k.H + so, 74, 2.f);
+            std::vector<float> o((size_t)k.S * k.H * k.hd), ref = o;
+            CcAttn a = {k.S, k.H, k.KV, k.hd, k.pos_base, cap, 0, k.H * k.hd, k.hd, 0, 0, 0, 0, 0, k.H * k.hd, 0, 0,
+                        1.f / sqrtf((float)k.hd), k_off, k_off};
+            CcAttnW w = {a, k.win, 1, so};
+            ref_attn_w(q.data(), kc.data(), vc.data(), ref.data(), &a, k.win, sk.data(), so, k.ring);
+            CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *sb = up(sk), *ob = T->buf(o.size() * 4, CC_DEV);
+            char what[160];
+            snprintf(what, sizeof what, "prompt rows, window %d and sinks: H %d KV %d hd %d, %d rows after %d%s", k.win, k.H, k.KV, k.hd,
+                     k.S, k.pos_base, k.ring ? ", a ring" : "");
+            float d = 1e30f;
+            int ok = T->begin() && (k.ring ? T->size >= offsetof(ColiCudaChainOps, attn_wr) + sizeof T->attn_wr && T->attn_wr(qb, kb, vb, ob, NULL, sb, &w, k.ring)
+                                           : T->attn_w(qb, kb, vb, ob, NULL, sb, &w)) && T->submit(1);
+            if (ok) d = maxdiff(down(ob, o.size()).data(), ref.data(), o.size());
+            ck(d < 4e-3f, what);
+            printf("  %s: max |diff| %.2e\n", what, d);
+            T->free(qb); T->free(kb); T->free(vb); T->free(sb); T->free(ob);
+        }
+    }
+    {   /* a decode's or a verify's rows with a window and a sink per head (Flint) after many positions:
+         * in blocks of positions, a KV head's query heads a block, float32 (within 1e-4); a verify's
+         * rows each a one-row step's bits */
+        struct { int H, KV, hd, S, pos_base, win, ring; } cs[] = {{32, 4, 128, 1, 17000, 0, 0}, {32, 4, 128, 3, 5000, 128, 0},
+                                                                  {32, 4, 128, 1, 4000, 200, 236}, {16, 2, 256, 4, 2000, 0, 0}};
+        for (auto &k : cs) {
+            const int cap = k.ring ? k.ring : k.pos_base + k.S + 9, k_off = 32, so = 3;
+            std::vector<float> q = rnd((size_t)k.S * k.H * k.hd, 81), kc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 82),
+                               vc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 83), sk = rnd((size_t)k.H + so, 84, 2.f);
+            std::vector<float> o((size_t)k.S * k.H * k.hd), ref = o;
+            CcAttn a = {k.S, k.H, k.KV, k.hd, k.pos_base, cap, 0, k.H * k.hd, k.hd, 0, 0, 0, 0, 0, k.H * k.hd, 0, 0,
+                        1.f / sqrtf((float)k.hd), k_off, k_off};
+            CcAttnW w = {a, k.win, 1, so};
+            ref_attn_w(q.data(), kc.data(), vc.data(), ref.data(), &a, k.win, sk.data(), so, k.ring);
+            CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *sb = up(sk), *ob = T->buf(o.size() * 4, CC_DEV);
+            const int wr = k.ring && T->size >= offsetof(ColiCudaChainOps, attn_wr) + sizeof T->attn_wr;
+            auto run = [&](CcBuf *out, const CcAttnW *x) {
+                return T->begin() && (k.ring ? wr && T->attn_wr(qb, kb, vb, out, NULL, sb, x, k.ring) : T->attn_w(qb, kb, vb, out, NULL, sb, x)) &&
+                       T->submit(1);
+            };
+            char what[160];
+            snprintf(what, sizeof what, "decode rows, window %d and sinks: H %d KV %d hd %d, %d rows after %d%s", k.win, k.H, k.KV, k.hd,
+                     k.S, k.pos_base, k.ring ? ", a ring" : "");
+            float d = 1e30f;
+            if (run(ob, &w)) d = maxdiff(down(ob, o.size()).data(), ref.data(), o.size());
+            ck(d < 1e-4f, what);
+            printf("  %s: max |diff| %.2e\n", what, d);
+            if (k.S > 1) {
+                std::vector<float> all = down(ob, o.size());
+                CcBuf *o1 = T->buf((size_t)k.H * k.hd * 4, CC_DEV);
+                int same = 1;
+                for (int r = 0; r < k.S && same; r++) {
+                    CcAttnW w1 = w; w1.a.S = 1; w1.a.pos_base = k.pos_base + r; w1.a.q_off = r * a.q_row; w1.a.o_off = 0;
+                    same = run(o1, &w1) && !memcmp(down(o1, (size_t)k.H * k.hd).data(), all.data() + (size_t)r * k.H * k.hd, (size_t)k.H * k.hd * 4);
+                }
+                ck(same, "and each row a one-row step's bits");
+                T->free(o1);
+            }
+            T->free(qb); T->free(kb); T->free(vb); T->free(sb); T->free(ob);
+        }
+    }
+    {   /* a float16 KV cache (kvh: attn_h, attn_wh, copy_regions_h): K and V of float16 values give
+         * attn's bits from a float32 cache of the same values on every path: a decode's blocks by KV
+         * head and by head, a prompt chunk on the tensor cores, a window with sinks, linear and in a ring */
+        if (T->size < offsetof(ColiCudaChainOps, copy_regions_h) + sizeof T->copy_regions_h || !T->kvh()) printf("  (no float16 cache here)\n");
+        else {
+            struct { int H, KV, hd, S, pos_base, win, ring, sink; } cs[] = {
+                {16, 2, 256, 3, 2500, 0, 0, 0}, {8, 8, 128, 4, 700, 0, 0, 0}, {16, 2, 256, 70, 33, 0, 0, 0}, {4, 2, 64, 40, 0, 0, 0, 0},
+                {32, 4, 128, 1, 4000, 200, 236, 1}, {32, 4, 128, 90, 900, 129, 230, 1}, {32, 4, 128, 3, 5000, 128, 0, 1}};
+            for (auto &k : cs) {
+                const int cap = k.ring ? k.ring : k.pos_base + k.S + 9, k_off = 32, so = 3;
+                std::vector<float> q = rnd((size_t)k.S * k.H * k.hd, 91), kc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 92),
+                                   vc = rnd(kc.size(), 93), sk = rnd((size_t)k.H + so, 94, 2.f), o((size_t)k.S * k.H * k.hd);
+                kv16_round(kc.data(), (int64_t)kc.size()); kv16_round(vc.data(), (int64_t)vc.size());
+                std::vector<uint16_t> kh(kc.size()), vh(vc.size());
+                kv16_pack(kh.data(), kc.data(), (int64_t)kc.size()); kv16_pack(vh.data(), vc.data(), (int64_t)vc.size());
+                CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *sb = up(sk), *o32 = T->buf(o.size() * 4, CC_DEV), *o16 = T->buf(o.size() * 4, CC_DEV);
+                CcBuf *khb = T->buf(kh.size() * 2, CC_DEV), *vhb = T->buf(vh.size() * 2, CC_DEV);
+                int ok = khb && vhb && T->begin() && T->write(khb, 0, kh.data(), kh.size() * 2) && T->write(vhb, 0, vh.data(), vh.size() * 2) &&
+                         T->submit(1);
+                CcAttn a = {k.S, k.H, k.KV, k.hd, k.pos_base, cap, 0, k.H * k.hd, k.hd, 0, 0, 0, 0, 0, k.H * k.hd, 0, 0,
+                            1.f / sqrtf((float)k.hd), k_off, k_off};
+                CcAttnW w = {a, k.win, k.sink, so};
+                if (k.win || k.sink)
+                    ok = ok && T->begin() && (k.ring ? T->attn_wr(qb, kb, vb, o32, NULL, sb, &w, k.ring) : T->attn_w(qb, kb, vb, o32, NULL, sb, &w)) &&
+                         T->attn_wh(qb, khb, vhb, o16, NULL, sb, &w, k.ring) && T->submit(1);
+                else ok = ok && T->begin() && T->attn(qb, kb, vb, o32, NULL, NULL, &a) && T->attn_h(qb, khb, vhb, o16, NULL, NULL, &a) && T->submit(1);
+                char what[160];
+                snprintf(what, sizeof what, "a float16 cache: H %d KV %d hd %d, %d rows after %d%s%s: a float32 cache's bits", k.H, k.KV, k.hd,
+                         k.S, k.pos_base, k.win ? ", a window and sinks" : "", k.ring ? " in a ring" : "");
+                ck(ok && !memcmp(down(o32, o.size()).data(), down(o16, o.size()).data(), o.size() * 4), what);
+                T->free(qb); T->free(kb); T->free(vb); T->free(sb); T->free(o32); T->free(o16); T->free(khb); T->free(vhb);
+            }
+            /* copy_regions_h: a step's K rows into a head-major cache (a grid), and one region alone */
+            const int n = 5, KV = 2, kvd = 64, rows = 20, pb = 7;
+            std::vector<float> src = rnd((size_t)n * KV * kvd, 95);
+            std::vector<CcRegion> rg;
+            for (int s2 = 0; s2 < n; s2++)
+                for (int h = 0; h < KV; h++) rg.push_back(CcRegion{((size_t)h * rows + pb + s2) * kvd, (size_t)s2 * KV * kvd + (size_t)h * kvd, (size_t)kvd});
+            rg.push_back(CcRegion{(size_t)KV * rows * kvd - 10, 3, 10});
+            std::vector<uint16_t> want((size_t)KV * rows * kvd, 0), got(want.size());
+            for (auto &r : rg) kv16_pack(want.data() + r.dst, src.data() + r.src, (int64_t)r.n);
+            CcBuf *sbuf = up(src), *dbuf = T->buf(want.size() * 2, CC_DEV);
+            int ok = dbuf && T->begin() && T->copy_regions_h(dbuf, sbuf, rg.data(), (int)rg.size()) && T->submit(1) &&
+                     T->read(dbuf, 0, got.data(), got.size() * 2);
+            ck(ok && got == want, "copy_regions_h: a grid of rows and a region alone, each value its float16");
+            T->free(sbuf); T->free(dbuf);
         }
     }
     printf("dnconv\n");
@@ -876,10 +1100,79 @@ int main(void) {
         ck(ok && same, "eight rounds: each answer read after its word, before the next");
         T->free(df); T->free(hf); T->free(ans); T->free(dst);
     }
+    printf("pick\n");
+    {
+        const int V = 248320;
+        std::vector<float> lg = rnd((size_t)V, 91, 10.f);
+        lg[173421] = 22.f;   /* a realistic peak above the bulk */
+        int best = 0;
+        for (int i = 1; i < V; i++) if (lg[i] > lg[best]) best = i;
+        double z = 0.0; float mx = lg[best];
+        for (int i = 0; i < V; i++) if (lg[i] - mx > -20.f) z += expf(lg[i] - mx);
+        float p_ref = z > 0.0 ? (float)(1.0 / z) : 0.f;
+
+        CcBuf *lb = up(lg), *pb = T->buf(8, CC_DOWN), *small = T->buf(4, CC_DOWN);
+        int ok = T->pick && T->begin() && T->pick(lb, pb, V) && T->submit(1);
+        const void *pk = T->ptr(pb);
+        int got_id = pk ? ((const int *)pk)[0] : -1;
+        float got_p = pk ? ((const float *)pk)[1] : 0.f;
+        ck(ok && got_id == best && fabsf(got_p - p_ref) <= 1e-5f * p_ref,
+           "248320 logits: argmax id and softmax probability (within 20 of max) into an 8-byte DOWN buffer");
+
+        /* equal maxima across warps, within a warp and on the same thread: the lowest id wins */
+        int ties[3][2] = {{137, 190000}, {137, 138}, {137, 137 + 256 * 50}};
+        int tie_ok = 1;
+        for (int c = 0; c < 3; c++) {
+            std::vector<float> lt = lg;
+            lt[ties[c][0]] = 35.f;
+            lt[ties[c][1]] = 35.f;
+            double zt = 0.0;
+            for (int i = 0; i < V; i++) if (lt[i] - 35.f > -20.f) zt += expf(lt[i] - 35.f);
+            float pt = (float)(1.0 / zt);
+            int okc = T->begin() && T->write(lb, 0, lt.data(), (size_t)V * 4) && T->pick(lb, pb, V) && T->submit(1);
+            int idc = ((const int *)pk)[0];
+            float pc = ((const float *)pk)[1];
+            tie_ok &= okc && idc == ties[c][0] && fabsf(pc - pt) <= 1e-5f * pt;
+        }
+        ck(tie_ok, "equal maxima (across warps, within a warp, same thread): lowest index wins");
+        ck(!T->pick(lb, small, V) && !T->pick(lb, pb, V + 1), "pick past its buffers refused");
+        T->free(lb); T->free(pb); T->free(small);
+    }
+    printf("matmul_rows\n");
+    {
+        for (int c = 0; c < 3; c++) {
+            int fmt = c == 0 ? 0 : 1, I = c == 2 ? 518 : 512, O = 1024, n = 137;
+            std::vector<float> dq, x = rnd((size_t)I, 120 + c), want((size_t)n, 0.f);
+            ColiCudaTensor *t = NULL;
+            if (fmt == 0) {
+                dq = rnd((size_t)O * I, 130 + c);
+                std::vector<float> ones((size_t)O, 1.f);
+                coli_cuda_tensor_upload(&t, dq.data(), ones.data(), 0, I, O, 0);
+            } else {
+                t = moe_mat(1, 0, I, O, 140 + c, dq);
+            }
+            std::vector<int> ids((size_t)n);
+            for (int j = 0; j < n; j++) {
+                ids[j] = (j * 7 + 19) % O;
+                double s = 0;
+                for (int i = 0; i < I; i++) s += (double)x[i] * dq[(size_t)ids[j] * I + i];
+                want[j] = (float)s;
+            }
+            CcBuf *ib = T->buf((size_t)n * 4, CC_DEV), *xb = up(x), *yb = T->buf((size_t)n * 4, CC_DEV);
+            int ok = T->matmul_rows && t && ib && xb && yb && T->begin() && T->write(ib, 0, ids.data(), (size_t)n * 4) &&
+                     T->matmul_rows(t, ib, xb, yb, n) && T->submit(1);
+            std::vector<float> got = down(yb, (size_t)n);
+            ck(ok && maxdiff(got.data(), want.data(), (size_t)n) < 2e-4,
+               c == 0 ? "matmul_rows fmt 0 (f32)" : c == 1 ? "matmul_rows fmt 1 (i8, I % 16 == 0)" : "matmul_rows fmt 1 (i8, I % 16 != 0)");
+            if (c == 0) ck(!T->matmul_rows(t, ib, xb, yb, n + 1), "matmul_rows past its buffer refused");
+            if (t) coli_cuda_tensor_free(t);
+            T->free(ib); T->free(xb); T->free(yb);
+        }
+    }
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 18, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 21, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;

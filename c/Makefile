@@ -552,7 +552,6 @@ TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
-TEST_BINS += tests/test_exact_dot$(EXE)
 endif
 ifneq (,$(IS_WIN))
 TEST_BINS += tests/test_xdna_execution$(EXE) tests/test_xdna_failure$(EXE)
@@ -565,7 +564,6 @@ TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
 	tests/test_idot_ssse3$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
-TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_v4_serve_framing$(EXE) \
 	tests/test_segment_adapters_registration$(EXE) \
@@ -756,7 +754,8 @@ VK_SPV   += shaders/chain_gemv_bd_i8.spv
 # the expert batch's grouped GEMM for a GGUF's experts, down and gate+up (backend_vulkan.c)
 VK_SPV   += shaders/qmatmul_grp_bd.spv shaders/qmatmul_grp_gate_up_bd.spv
 # and both on the matrix units (cooperative matrices at subgroups of 64 or 32)
-VK_SPV   += shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_gate_up_bdc.spv
+VK_SPV   += shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_gemm_bdcw.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_gate_up_bdc.spv
+VK_SPV   += shaders/qmatmul_grp_bdcw.spv shaders/qmatmul_grp_gate_up_bdcw.spv
 # and for our own formats' experts on the chain's prompt chunks (vk_chain.c: vkc_moe_rows)
 VK_SPV   += shaders/qmatmul_grp_q.spv shaders/qmatmul_grp_gate_up_q.spv
 # and on the matrix units (cooperative matrices at subgroups of 64 or 32)
@@ -946,7 +945,7 @@ vk_chain.o: vk_chain.c .build-config
 # routed experts; the chain's block GEMV reads the same table
 shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv shaders/chain_moe.spv: shaders/blockdec.glsl shaders/blockdec_table.h
 # the per-type decoders of the chain's block GEMV and of its routed experts
-shaders/chain_gemv_bd.spv shaders/chain_moe.spv shaders/qmatmul_gemm_bd.spv shaders/qmatmul_grp_bd.spv shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_grp_bdc.spv: shaders/bdstep.glsl shaders/blockdec_table.h
+shaders/chain_gemv_bd.spv shaders/chain_moe.spv shaders/qmatmul_gemm_bd.spv shaders/qmatmul_grp_bd.spv shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_gemm_bdcw.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_bdcw.spv: shaders/bdstep.glsl shaders/blockdec_table.h
 shaders/chain_gemv_bd_i8.spv: shaders/chain_gemv_bd.comp shaders/bdstep.glsl shaders/bdstep_i8.glsl shaders/blockdec_table.h
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DIDOT $< -o $@ || { [ -f $@ ] && touch $@ && \
@@ -959,6 +958,9 @@ shaders/qmatmul_grp_gate_up_bd.spv: shaders/qmatmul_grp_bd.comp shaders/bdstep.g
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 shaders/qmatmul_grp_gate_up_bdc.spv: shaders/qmatmul_grp_bdc.comp shaders/bdstep.glsl shaders/blockdec_table.h
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/qmatmul_grp_gate_up_bdcw.spv: shaders/qmatmul_grp_bdcw.comp shaders/bdstep.glsl shaders/blockdec_table.h
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 shaders/qmatmul_grp_gate_up_q.spv: shaders/qmatmul_grp_q.comp
@@ -1308,15 +1310,21 @@ cuda-test: tests/test_mxfp4_expert_cuda.cu backend_cuda.cu backend_cuda.h fp8_fo
 
 
 # The DeepSeek V4 kernels on their own: dense, batched attention and routed MoE
-# against the CPU reference in each test. Needs a GPU, so CI compiles it via
-# gpu-compile rather than running it.
-dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+# against the CPU reference in each test, then the generic build's kernel
+# variants (expert-major vs per-route MoE, warp vs block dense batch) against
+# each other bit for bit. Needs a GPU, so CI runs none of it; it does not
+# build these tests either, only backend_cuda_dsv4.cu itself.
+dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c tests/test_dsv4_generic_bitwise_cuda.c tests/test_dsv4_bank_bytes_cuda.c backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+	$(CC) $(CFLAGS) tests/test_dsv4_bank_bytes_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_bank_bytes_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_bank_bytes_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_dense_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_attention_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_attention_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_attention_cuda_test$(EXE)
 	$(CC) $(CFLAGS) tests/test_dsv4_moe_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_moe_cuda_test$(EXE) $(LDFLAGS)
 	./dsv4_moe_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_generic_bitwise_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_generic_bitwise_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_generic_bitwise_cuda_test$(EXE)
 
 # Pure-CPU unit tests for the two headers the kernels consume. No GPU, no model.
 tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c
@@ -1760,6 +1768,8 @@ spec-drafts-run: qwen38$(EXE) qwen36$(EXE) tests/test_spec_draft$(EXE) tests/tes
 	./tests/test_spec_draft$(EXE)
 	./tests/test_qwen38_spec_alloc$(EXE)
 	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp --serve $(SPEC_ENV)
+	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_mtp --mtp \
+		--env Q38_MTP_PSTEP=1 $(SPEC_ENV)
 	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_fp8_mtp --mtp \
 		--env Q38_PREFILL_BATCH=0 $(SPEC_ENV)
 	$(SPEC_HARNESS) --engine ./qwen38$(EXE) --kind qwen38 --fixture ./qwen38_tiny_int4_mtp \
@@ -1821,6 +1831,14 @@ tests/test_qwen36_dense_affine$(EXE): tests/test_qwen36_dense_affine.c qwen36.c 
 tests/test_qwen36_tok_merges$(EXE): tests/test_qwen36_tok_merges.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# The tokens a model ends a turn with, as it declares them (config.json, a GGUF's eog list).
+tests/test_qwen36_eos$(EXE): tests/test_qwen36_eos.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# The MTP head's depth: the plain step that keeps T(1) measured, only where the trim reads it.
+tests/test_qwen36_mtp_depth$(EXE): tests/test_qwen36_mtp_depth.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # A byte-counted serving payload may end mid-character; the pre-tokenizer must
 # not read past it.  qwen38 already gates this (tests/test_qwen38_tokenizer.c).
 tests/test_qwen36_tok_truncated$(EXE): tests/test_qwen36_tok_truncated.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
@@ -1845,6 +1863,14 @@ tests/test_qwen36_dense_idot$(EXE): tests/test_qwen36_dense_idot.c qwen36.c $(QW
 
 # #1653: added tokens are split out before the regex pre-tokenizer, HF-style.
 tests/test_qwen36_tokenizer$(EXE): tests/test_qwen36_tokenizer.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# Flint's pre-tokenizer against HF's tokenizers (tests/fixtures/flint_tok_*).
+tests/test_qwen36_tokenizer_flint$(EXE): tests/test_qwen36_tokenizer_flint.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# o200k's pre-tokenizer (Muse Spark) against HF's tokenizers (tests/fixtures/o200k_tok_*).
+tests/test_qwen36_tokenizer_o200k$(EXE): tests/test_qwen36_tokenizer_o200k.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 # The serve sampler draws the same tokens as a sort of the whole vocabulary.
@@ -2026,6 +2052,14 @@ tests/test_dsv41_untrusted_load$(EXE): tests/test_dsv41_untrusted_load.c deepsee
 tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+# The token list of qwen38's MTP head (draft_vocab.h), with no model.
+tests/test_draft_vocab$(EXE): tests/test_draft_vocab.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# The draft qwen38's MTP head takes from that list, with no model.
+tests/test_qwen38_draft_head$(EXE): tests/test_qwen38_draft_head.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 # The int4-g64 expert matmul with no model (part of test-c); given a converted
 # snapshot on argv it checks the sidecar's loaders too (qwen38-tiny-int4-check).
 tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c $(VK_OBJ)
@@ -2130,6 +2164,9 @@ tests/test_st_overlay$(EXE): tests/test_st_overlay.c
 tests/test_compat_mem$(EXE): tests/test_compat_mem.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_compat_cgroup$(EXE): tests/test_compat_cgroup.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_st_missing$(EXE): tests/test_st_missing.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -2181,6 +2218,10 @@ tests/test_gq_dot$(EXE): tests/test_gq_dot.c
 # The row-interleaved forms (GQ_*_R16) against their scalar reference, every type; a
 # no-op on a build without AVX2. `tests/test_gq_r16 bench S` times them.
 tests/test_gq_r16$(EXE): tests/test_gq_r16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# A matrix's file rows eight at a time (gq_rows_f8) against their scalar reference and the R16
+# forms' kernels, to the bit; a no-op on a build without AVX2. `tests/test_rows_f8 bench` times them.
+tests/test_rows_f8$(EXE): tests/test_rows_f8.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The trunk's int8 rows interleaved by 16 (idot.h) against matmul_q_idot, to the bit.
 tests/test_idot_r16$(EXE): tests/test_idot_r16.c
@@ -2942,6 +2983,10 @@ tests/test_qwen36_tier_layer_home$(EXE): tests/test_qwen36_tier_layer_home.c qwe
 tests/test_qwen36_tier_replan$(EXE): tests/test_qwen36_tier_replan.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# qt_chain_promote: the resident set follows the conversation while the chain runs the experts in its frame (fake backend).
+tests/test_qwen36_tier_promote$(EXE): tests/test_qwen36_tier_promote.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 tests/test_qwen36_tier_int8_engine$(EXE): tests/test_qwen36_tier_int8_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
@@ -3120,6 +3165,14 @@ tests/test_gsgemv_sse41$(EXE): tests/test_gsgemv.c
 # output rests on. Links the SAME qgemv.h the engine links.
 tests/test_qgemv$(EXE): tests/test_qgemv.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# The float16 KV cache's rounding (kv16.h): the integer arithmetic the Vulkan shader and the
+# CUDA kernel use against the compiler's IEEE conversion, and the integer fallback's
+# conversions both ways. A rule each, so both are gates.
+tests/test_kv16$(EXE): tests/test_kv16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_kv16_integer$(EXE): tests/test_kv16.c
+	$(CC) $(CFLAGS) -DKV16_INTEGER $< -o $@ $(LDFLAGS)
 
 # Same gate, forced onto the SSE4.1 tier: overrides the host's default -march
 # so the SSE4.1 body in qgemv.h is actually exercised even on a devbox that

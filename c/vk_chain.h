@@ -125,6 +125,7 @@ typedef struct { int nseg, D, per_row, x_off, x_row, x_seg, y_off, y_row, y_seg,
 #define VKC_NORM_ADD1 1
 #define VKC_NORM_NOW  2
 #define VKC_NORM_L2   4
+#define VKC_NORM_PRESCALE 8   /* scale by w, then normalise (Muse Spark) */
 int  vkc_norm(VkcBuf *x, VkcBuf *w, VkcBuf *y, const VkcNorm *p);
 /* chain_rope.comp */
 typedef struct { int nseg, per_row, x_off, x_row, x_seg, half_, cs_off, cs_row; } VkcRope;
@@ -142,6 +143,15 @@ int  vkc_attn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf
 typedef struct { VkcAttn a; int win, ring, vd, kv_pm, sink, sink_off; } VkcAttnW;
 int  vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
                 const VkcAttnW *p);
+/* A float16 KV cache: vkc_attn and vkc_attn_w over caches of halves (kc, vc and their offsets
+ * in halves; flash's offsets multiples of eight), every path the bits of a float32 cache of the
+ * same values; vkc_copy_regions_h copies float32 regions of src (offsets in floats) into such
+ * a cache (offsets and lengths in halves, even), each value rounded to the nearest float16.
+ * vkc_kvh_ready: 1 when the device takes them. */
+int  vkc_attn_h(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, const VkcAttn *p);
+int  vkc_attn_wh(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk, const VkcAttnW *p);
+int  vkc_copy_regions_h(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n);
+int  vkc_kvh_ready(void);
 /* From this many rows (COLI_VK_ATTN_BLOCK, 16; 0 = never) vkc_attn and vkc_attn_w take
  * chain_attnb.comp: a workgroup per KV head and block of rows, each K and V row read once
  * per block instead of once per (head, row); below it chain_attn as before. */
@@ -190,6 +200,9 @@ int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *pr
 #define VKC_EW_HC_APPLY 6
 #define VKC_EW_SCALE    7
 #define VKC_EW_GATE_ADD 8
+#define VKC_EW_SIGMUL   9    /* y = a * sigmoid(b) */
+#define VKC_EW_RESGATE  10   /* y = e[col] * a + c[col] * b (alpha, beta a column) */
+#define VKC_EW_F16      11   /* y = a clamped to +-65504 and rounded to the nearest float16 (kv16.h: a KV cache in float16) */
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } VkcEw;
 int  vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p);
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: the selection of S rows, run as two dispatches that write the
@@ -304,6 +317,8 @@ typedef struct {
     ColiVkTensor *o;              /* [D x H*V]; NULL: the context stays in s->ctx */
     VkcBuf *prm;                  /* the norm weights: q latent at q_norm (unused with q_lora 0), */
     size_t q_norm, kv_norm;       /*   kv latent at kv_norm (floats) */
+    int kv16;                     /* the new latent and rope rows rounded to float16 as they are written
+                                   * (the host keeps them in float16: colibri's KV16) */
 } VkcMla;
 typedef struct { VkcBuf *qa, *q, *kv, *qabs, *clat, *ctx; int rows; } VkcMlaScratch;
 typedef struct { VkcBuf *lat, *rope; int cap; } VkcMlaCache;   /* [cap][K] and [cap][R] (rope NULL with R 0) */
@@ -482,6 +497,9 @@ int vkc_prewarm(const VkcPrewarm *w);
  * (qmatmul_gemm_bd.comp), else only the GEMV's few rows a step suit them */
 int vkc_gemm_bd_ready(void);
 int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p);
+/* chain_moe_gv.comp's int4 fast path (each lane's steps loaded ahead, the loop's bits):
+ * 1 on, 0 off, -1 from COLI_VK_MOE_GV_HQ (default on). For tests. */
+void vkc_moe_gv_hq(int on);
 /* A GGUF's experts (blocks, gfmt and dfmt both types bdstep_i8.glsl has) in the CPU's
  * integer form: the input rows quantized to int8 per 32, packed 4 x 8 integer dot products
  * (ggml_quants.h's gq_quant_act_ref and gq_dot_i8, the same integers and scales). On by
@@ -848,7 +866,10 @@ typedef struct {
     unsigned long long grp_coop;       /* grouped expert GEMMs on the matrix units (qmatmul_grp_qc, qmatmul_grp*_bdc) */
     unsigned long long gemv_xg;        /* decode GEMVs whose row is past the staging: x from its buffer (chain_gemv.comp XG) */
     unsigned long long attn_dec;       /* decode attentions split over their positions' blocks (chain_attn_dec.comp) */
+    unsigned long long attn_dec_gqa;   /* of them, a KV head's query heads a workgroup (its grouped mode) */
     unsigned long long moe_gv;         /* routed-expert decode steps in our formats on chain_moe_gv.comp */
+    unsigned long long tile_wide;      /* of the tile GEMMs, a GGUF's on 128 x 128 tiles (qmatmul_gemm_bdcw.comp) */
+    unsigned long long grp_wide;       /* of the grouped expert GEMMs, those at the wider item (qmatmul_grp*_bdcw.comp) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

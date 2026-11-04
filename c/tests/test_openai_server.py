@@ -1,3 +1,4 @@
+import contextlib
 import http.client
 import io
 import json
@@ -2439,11 +2440,15 @@ class DispatcherTest(unittest.TestCase):
             polls += 1
             return disconnected or polls > 20
 
-        with self.assertRaises(ClientCancelled):
+        log = io.StringIO()
+        with self.assertRaises(ClientCancelled), contextlib.redirect_stderr(log):
             engine.generate("hello", 8, 0.7, 0.9, sink, cancelled=consumer_gone)
         engine.close()
         self.assertEqual(output, ["x"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+        # #2290: the departure and the freed slot are in the log
+        self.assertIn("the client left while the engine was generating", log.getvalue())
+        self.assertIn("after the cancel; the slot is free", log.getvalue())
 
     def test_cancels_generation_before_first_frame(self):
         # #908: a client that disconnects while the engine is still prefilling
@@ -2477,17 +2482,22 @@ class DispatcherTest(unittest.TestCase):
                 outcome.append("cancelled")
 
         thread = threading.Thread(target=generate)
-        thread.start()
-        for _ in range(200):
-            if any(frame.startswith(b"SUBMIT") for frame in process.writes):
-                break
-            time.sleep(0.01)
-        flag["cancelled"] = True
-        thread.join(timeout=2)
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log):
+            thread.start()
+            for _ in range(200):
+                if any(frame.startswith(b"SUBMIT") for frame in process.writes):
+                    break
+                time.sleep(0.01)
+            flag["cancelled"] = True
+            thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
         engine.close()
         self.assertEqual(outcome, ["cancelled"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+        # #2290: a client gone while the prompt is read is named as such
+        self.assertIn("the client left while the engine was reading the prompt", log.getvalue())
+        self.assertIn("after the cancel; the slot is free", log.getvalue())
 
     def test_stops_generation_through_successful_done_path(self):
         request_id = None
@@ -2540,7 +2550,8 @@ def _capture_frames(body, path="/v1/completions"):
                           data=data, headers=headers)
         with urlopen(request, timeout=2) as response:
             status = response.status
-            parsed = json.load(response)
+            parsed = (response.read().decode() if body.get("stream")
+                      else json.load(response))
     finally:
         server.scheduler.close()
         server.shutdown()
@@ -2675,6 +2686,56 @@ class SeedWireFrameTest(unittest.TestCase):
         self.assertEqual(status_seeded, 200)
         self.assertEqual(body_seeded["choices"][0], body_plain["choices"][0])
         self.assertEqual(frames_seeded, frames_plain)
+
+
+class CompletionTokenIdsTest(unittest.TestCase):
+    def test_glm_token_ids_reach_the_engine_without_text_tokenization(self):
+        body = {"model": "test-model", "prompt": [12, 345, 6],
+                "temperature": 0, "max_tokens": 4}
+        status, response, frames = _capture_frames(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(response["choices"][0]["text"], "Hello")
+        self.assertEqual(frames, [b"SUBMIT 1 0 8 4 0 0.9 0 ids=1\n12 345 6\n"])
+
+    def test_streaming_token_ids_use_the_same_wire(self):
+        status, _, frames = _capture_frames({"model": "test-model", "prompt": [12, 345],
+                                             "stream": True, "max_tokens": 4})
+        self.assertEqual(status, 200)
+        self.assertEqual(frames, [b"SUBMIT 1 0 6 4 0.7 0.9 0 ids=1\n12 345\n"])
+
+    def test_other_engines_refuse_token_ids_before_generation(self):
+        engine = ScriptedEngine(supports_tok_ids=False)
+        base = _spawn_test_server(self, engine)
+        status, error = _error_body(self, lambda: _post_completions(base, {
+            "model": "test-model", "prompt": [12, 345]}))
+        self.assertEqual((status, error["param"], error["code"]),
+                         (400, "prompt", "unsupported_parameter"))
+        self.assertEqual(engine.calls, [])
+
+    def test_malformed_token_ids_are_refused_before_generation(self):
+        engine = ScriptedEngine()
+        base = _spawn_test_server(self, engine)
+        for prompt in ([], [True], [1.0], [-1], [2147483648], [1, "2"], [[1, 2]]):
+            with self.subTest(prompt=prompt):
+                status, error = _error_body(self, lambda: _post_completions(base, {
+                    "model": "test-model", "prompt": prompt}))
+                self.assertEqual((status, error["param"]), (400, "prompt"))
+        self.assertEqual(engine.calls, [])
+
+    def test_out_of_vocabulary_id_is_a_named_client_error(self):
+        def respond(process, frame):
+            rid = frame.split()[1]
+            process.stdout.feed(b"ERROR " + rid + b" BAD_REQUEST\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        self.addCleanup(engine.close)
+        base = _spawn_test_server(self, engine)
+        status, error = _error_body(self, lambda: _post_completions(base, {
+            "model": "test-model", "prompt": [2147483647]}))
+        self.assertEqual((status, error["param"], error["code"]),
+                         (400, "prompt", "invalid_value"))
 
 
 class CapSentinelShimTest(unittest.TestCase):
@@ -2915,6 +2976,174 @@ class CapSentinelShimTest(unittest.TestCase):
         for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT",
                     "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
             self.assertNotIn(key, env)
+
+
+class _DeadableEngine(FakeEngine):
+    """A served engine that can die: what Engine.alive and ImageEngine.alive report."""
+    def __init__(self, name="engine"):
+        super().__init__()
+        self.name = name
+        self.alive = True
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
+class EngineRestartTest(unittest.TestCase):
+    """#2290: a dead engine under a live server is seen by /health and started again."""
+
+    def test_a_paused_scheduler_admits_nothing_until_it_resumes(self):
+        scheduler = GenerationScheduler(max_queue=1, queue_timeout=5)
+        scheduler.pause()
+        admitted = threading.Event()
+
+        def waiter():
+            with scheduler.admit():
+                admitted.set()
+        thread = threading.Thread(target=waiter, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 2
+        while scheduler.snapshot()["queued"] != 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(scheduler.snapshot()["queued"], 1)
+        self.assertFalse(admitted.wait(0.3))
+        # the queue is full while paused, though the slot itself is free
+        with self.assertRaises(APIError) as caught:
+            with scheduler.admit():
+                pass
+        self.assertEqual(caught.exception.status, 429)
+        scheduler.resume()
+        self.assertTrue(admitted.wait(2))
+        thread.join(timeout=2)
+        self.assertEqual(scheduler.snapshot()["completed"], 1)
+
+    def test_health_answers_503_while_the_engine_is_down(self):
+        engine = _DeadableEngine()
+        server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_port}/health"
+
+        def status():
+            try:
+                with urlopen(base, timeout=2) as response:
+                    return response.status, json.load(response)["status"], None
+            except HTTPError as error:
+                with error:
+                    return error.code, json.load(error)["status"], error.headers["Retry-After"]
+        self.assertEqual(status(), (200, "ok", None))
+        engine.alive = False
+        self.assertEqual(status(), (503, "engine_down", "5"))
+        server.keeps_engine = True       # serve() runs keep_engine: it is being started again
+        self.assertEqual(status(), (503, "restarting", "5"))
+        engine.alive = True
+        server.scheduler.pause()         # the new engine is loading
+        self.assertEqual(status(), (503, "restarting", "5"))
+        server.scheduler.resume()
+        self.assertEqual(status(), (200, "ok", None))
+
+    def _server(self, engine):
+        server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16)
+        self.addCleanup(server.server_close)
+        return server
+
+    def test_keep_engine_starts_a_dead_engine_again(self):
+        dead, fresh = _DeadableEngine("dead"), _DeadableEngine("fresh")
+        server = self._server(dead)
+        server.pinned_prefixes[0] = ("prefix", 3)
+        stopping = threading.Event()
+        paused_while_starting = []
+
+        def start():
+            paused_while_starting.append(server.scheduler.paused)
+            return fresh
+        thread = threading.Thread(target=openai_server.keep_engine,
+                                  args=(server, start, stopping, 0.01, (0.01, 0.02), 0.01), daemon=True)
+        thread.start()
+        dead.alive = False
+        deadline = time.monotonic() + 2
+        while server.engine is not fresh and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stopping.set()
+        thread.join(timeout=2)
+        self.assertIs(server.engine, fresh)
+        self.assertEqual(paused_while_starting, [True])
+        self.assertFalse(server.scheduler.paused)
+        self.assertEqual(server.engine_restarts, 1)
+        self.assertEqual(dead.closed, 1)
+        self.assertEqual(fresh.closed, 0)
+        self.assertEqual(server.pinned_prefixes, {})   # the photos lived in the dead KV
+
+    def test_keep_engine_tries_a_failed_start_again(self):
+        dead, fresh = _DeadableEngine("dead"), _DeadableEngine("fresh")
+        dead.alive = False
+        server = self._server(dead)
+        stopping = threading.Event()
+        attempts = []
+
+        def start():
+            attempts.append(time.monotonic())
+            if len(attempts) < 3:
+                raise RuntimeError("colibri engine exited unexpectedly")
+            return fresh
+        thread = threading.Thread(target=openai_server.keep_engine,
+                                  args=(server, start, stopping, 0.01, (0.05, 0.08), 0.01), daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 3
+        while server.engine is not fresh and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stopping.set()
+        thread.join(timeout=2)
+        self.assertIs(server.engine, fresh)
+        self.assertEqual(len(attempts), 3)
+        # 0.05 s after the first failure, then twice that capped at 0.08
+        self.assertGreaterEqual(attempts[1] - attempts[0], 0.045)
+        self.assertGreaterEqual(attempts[2] - attempts[1], 0.075)
+        self.assertFalse(server.scheduler.paused)
+
+    def test_an_engine_that_loads_after_the_server_stopped_is_closed(self):
+        dead, fresh = _DeadableEngine("dead"), _DeadableEngine("fresh")
+        dead.alive = False
+        server = self._server(dead)
+        stopping = threading.Event()
+
+        def start():
+            with server.engine_swap:     # serve()'s teardown, while the engine loads
+                stopping.set()
+            return fresh
+        openai_server.keep_engine(server, start, stopping, 0.01, (0.01, 0.02), 0.01)
+        self.assertIs(server.engine, dead)
+        self.assertEqual(fresh.closed, 1)
+        self.assertEqual(server.engine_restarts, 0)
+
+    def test_a_server_that_stops_with_its_engine_loads_nothing(self):
+        """Ctrl-C reaches the engine too: serve() sets `stopping` within the grace."""
+        dead = _DeadableEngine("dead")
+        dead.alive = False
+        server = self._server(dead)
+        stopping = threading.Event()
+        starts = []
+        threading.Timer(0.05, stopping.set).start()
+        openai_server.keep_engine(server, lambda: starts.append(1), stopping, 0.01,
+                                  (0.01, 0.02), 0.5)
+        self.assertEqual(starts, [])
+        self.assertIs(server.engine, dead)
+        self.assertEqual(dead.closed, 0)       # serve()'s teardown closes it
+
+    def test_engine_alive_follows_the_process_and_its_reader(self):
+        process = FakeProcess(lambda process, frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("olmoe", "model")
+        self.assertTrue(engine.alive)
+        process.returncode = -9          # killed: the pipe closes under the reader
+        process.stdout.close()
+        engine.dispatcher.join(timeout=2)
+        self.assertFalse(engine.alive)
+        engine.close()
 
 
 class HTTPTest(unittest.TestCase):
@@ -3500,6 +3729,22 @@ class HTTPTest(unittest.TestCase):
                     self.assertEqual(actual, expected)
                     self.assertEqual(len(self.engine.calls), before)
 
+    def test_non_json_numeric_constants_are_rejected(self):
+        """Python's json.loads accepts NaN, Infinity and -Infinity, none of which
+        is JSON (RFC 8259 section 6): they reached the engine as a 200."""
+        for path, fields in self._json_limit_routes():
+            for metadata in (b"NaN", b"Infinity", b"-Infinity",
+                             b'{"x":[1,NaN]}'):
+                with self.subTest(path=path, metadata=metadata):
+                    before = len(self.engine.calls)
+                    with self.assertRaises(HTTPError) as caught:
+                        self._request_with_raw_metadata(path, fields, metadata)
+                    with caught.exception as response:
+                        self.assertEqual(response.code, 400)
+                        self.assertEqual(json.load(response)["error"]["type"],
+                                         "invalid_request_error")
+                    self.assertEqual(len(self.engine.calls), before)
+
     def test_unpaired_surrogate_is_a_client_error(self):
         """JSON can spell a lone UTF-16 surrogate ("\\ud83d": a client that cut a
         string between the two halves of an emoji). json.loads accepts it, no
@@ -3900,6 +4145,12 @@ class StaticServingTest(unittest.TestCase):
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 404)
 
+    def test_nul_in_the_path_is_not_found(self):
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(self.base + "/%00", timeout=2)
+        self.addCleanup(caught.exception.close)
+        self.assertEqual(caught.exception.code, 404)
+
 
 class SchedulerHTTPTest(unittest.TestCase):
     def setUp(self):
@@ -3975,6 +4226,17 @@ class ToolArgumentTypeTest(unittest.TestCase):
         self.assertEqual(args, {"order_id": "A-1", "qty": 2, "express": True})
         self.assertIsInstance(args["qty"], int)
         self.assertIs(args["express"], True)
+
+    def test_optional_string_parameter_holding_digits_stays_a_string(self):
+        tools = [{"type": "function", "function": {"name": "lookup_order", "parameters": {
+            "type": "object", "properties": {
+                "order_id": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None},
+                "qty": {"anyOf": [{"type": "integer"}, {"type": "null"}], "default": None},
+            }}}}]
+        args = self._args("<tool_call>lookup_order"
+                          "<arg_key>order_id</arg_key><arg_value>12345</arg_value>"
+                          "<arg_key>qty</arg_key><arg_value>2</arg_value></tool_call>", tools)
+        self.assertEqual(args, {"order_id": "12345", "qty": 2})
 
     def test_unknown_parameter_keeps_permissive_decoding(self):
         args = self._args("<tool_call>lookup_order"
@@ -4469,6 +4731,31 @@ class TrailingAssistantTurnTest(unittest.TestCase):
                 with self.assertRaises(APIError):
                     resolve_generation_prompt(messages, {})
 
+    def test_rejects_a_non_string_text_part(self):
+        """A text part whose `text` is not a string is a client error: joining it
+        raised TypeError, which do_POST answered with HTTP 500."""
+        for text in (5, None, ["x"]):
+            messages = [{"role": "user", "content": "a"},
+                        {"role": "assistant", "content": [{"type": "text", "text": text}]}]
+            with self.on(), patch("openai_server.ARCH", "qwen36"):
+                with self.assertRaises(APIError) as caught:
+                    resolve_generation_prompt(messages, {})
+            self.assertEqual(caught.exception.status, 400)
+            self.assertEqual(caught.exception.param, "messages.1.content.0.text")
+
+    def test_glm53_rejects_non_string_assistant_content(self):
+        """A completed assistant turn bypasses continuation validation. Numeric and
+        object content reached `"</think>" in content` and became HTTP 500."""
+        for content in (1.5, {"text": "not a content-part list"}):
+            messages = [{"role": "user", "content": "a"},
+                        {"role": "assistant", "content": content},
+                        {"role": "user", "content": "b"}]
+            with self.subTest(content=content):
+                with self.assertRaises(APIError) as caught:
+                    render_chat_glm53(messages)
+                self.assertEqual(caught.exception.status, 400)
+                self.assertEqual(caught.exception.param, "messages.1.content")
+
     def test_rejects_tools_and_tool_calls(self):
         with self.on(), patch("openai_server.ARCH", "glm53"):
             with self.assertRaises(APIError):
@@ -4580,6 +4867,15 @@ class TrailingAssistantTurnTest(unittest.TestCase):
             self.assertEqual(normal, cont + END + cue)
             self.assertTrue(cont.endswith("La capitale e'"), cont[-40:])
             self.assertFalse(cont.endswith("<|end_message|>"))
+
+    def test_inkling_rejects_an_object_role(self):
+        """A role that is an object is unhashable. role_token.get(role) raised
+        TypeError, which do_POST answered with HTTP 500."""
+        messages = [{"role": {"x": 1}, "content": "go"}]
+        with self.assertRaises(APIError) as caught:
+            render_chat_inkling(messages)
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.param, "messages.0.role")
 
     def test_only_the_final_assistant_turn_is_opened(self):
         """Across every continuation family: only the TRAILING assistant turn is opened, and

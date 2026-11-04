@@ -286,7 +286,22 @@ def _glm53_dense_tensors(info, env):
     return dict(info, dense_bytes=total, embed_bytes=embedding, dense_tensors=adjusted)
 
 
-def _vk_released_tensor_bytes(tensor, family, env):
+def _q38_state_file(env, setting, default, model_dir):
+    return os.path.realpath(env.get(setting) or os.path.join(model_dir, default))
+
+
+def _q38_draft_list_on(env, model_dir):
+    """Whether qwen38 may score MTP drafts from a token list (draft_vocab.h), which needs the host
+    int8 rows of the lm_head. The head drafts unless Q38_MTP=0, and from a list unless Q38_MTP_VOCAB=0
+    or the counts file of the list is the file of the expert history.
+    A checkpoint without an MTP head has no list. Crediting 0 for the lm_head of that checkpoint is
+    still a lower bound."""
+    return ((env.get("Q38_MTP") or "").strip() != "0" and (env.get("Q38_MTP_VOCAB") or "").strip() != "0" and
+            _q38_state_file(env, "COLI_VOCAB_USAGE", ".coli_vocab", model_dir) !=
+            _q38_state_file(env, "COLI_USAGE", ".coli_usage", model_dir))
+
+
+def _vk_released_tensor_bytes(tensor, family, env, model_dir=""):
     """A lower bound on the host allocation an engine's dho pass can free.
 
     Only audited matrix names and source formats get credit. Keep norms, vision,
@@ -303,6 +318,8 @@ def _vk_released_tensor_bytes(tensor, family, env):
     head = name == "lm_head.weight"
     floating = dtype in ("BF16", "F16", "F32")
     if family == "qwen38":
+        if head and _q38_draft_list_on(env, model_dir):
+            return 0
         known = (head or part in _Q38_TRUNK_COMPONENTS or
                  part in ("linear_attn.in_proj_a", "linear_attn.in_proj_b", "ple.key_proj", "ple.value_proj") or
                  name in ("model.hyper_connection_mixer.input_mix_weight_down.weight",
@@ -765,7 +782,7 @@ def _q36_chain_layout(info, env, vulkan):
         types = ["full_attention" if i % interval == interval - 1 else "linear_attention" for i in range(L)]
     if L < 1 or len(types) < L:
         return None
-    attn = [t == "full_attention" for t in types[:L]]
+    attn = [t in ("full_attention", "sliding_attention") for t in types[:L]]   # Flint's windowed layers attend too
     rot = int(meta.get("rotary_dim") or 0)
     if rot <= 0:
         factor = float(meta.get("partial_rotary_factor") or c.get("partial_rotary_factor") or 0)
@@ -780,6 +797,9 @@ def _q36_chain_layout(info, env, vulkan):
         if layer is not None and layer < L and part in ("self_attn.q_norm", "self_attn.k_norm"):
             norms[layer] += hd
             continue
+        if layer is not None and layer < L and name.endswith(".self_attn.softmax_offset") and isinstance(shape, list) and shape:
+            norms[layer] += int(shape[0])                              # Flint: a sink per head, with the norms
+            continue
         if not isinstance(shape, list) or len(shape) != 2:
             continue
         if name == "lm_head.weight" or (layer is not None and layer < L and (part in _Q36_CHAIN_TAGS or part in (
@@ -789,7 +809,7 @@ def _q36_chain_layout(info, env, vulkan):
     def rows(part, default=0):
         return rows_of[part][0] if part in rows_of else default
     E = rows("mlp.gate")
-    SI = rows("mlp.shared_expert.gate_proj") or rows("mlp.gate_proj")
+    SI = max(rows("mlp.shared_expert.gate_proj"), rows("mlp.gate_proj"))   # Flint's dense layers: a wider MLP
     vh = rows("linear_attn.in_proj_b")
     conv, vd = rows("linear_attn.in_proj_qkv"), rows("linear_attn.in_proj_z")
     qo, kvo = rows("self_attn.q_proj"), rows("self_attn.k_proj")
@@ -2126,36 +2146,46 @@ def _parse_cgroup_counter(text):
     return value if value <= _CGROUP_UINT64_MAX else None
 
 
-def _cgroup_inactive_file(directory, v1=False):
-    """Return the inactive file cache charged to one cgroup, in bytes.
+def _cgroup_file_cache(directory, v1=False):
+    """Return the file cache charged to one cgroup, inactive and active, in bytes.
 
     ``memory.current`` (v1: ``usage_in_bytes``) charges clean page cache -- for
     this engine, the mmap'd shards a previous run left behind -- while the host
     half of the minimum, MemAvailable, counts such cache as available. Subtract
-    ``inactive_file`` (v1: ``total_inactive_file``, the hierarchical figure that
-    pairs with the hierarchical usage counter) the way Docker and cAdvisor
-    derive a working set. Absent statistics, or a kernel without the key,
-    subtract nothing; a present but malformed file is a refusal.
+    ``inactive_file`` and ``active_file`` (v1: ``total_inactive_file`` and
+    ``total_active_file``, the hierarchical figures that pair with the
+    hierarchical usage counter): at the limit the kernel reclaims from both
+    lists before it calls the OOM killer, and the pages of a model an engine
+    has mapped and read sit on the active one (seen on Linux 6.8 with MGLRU:
+    pages touched through a mapping went active, pages read with read() stayed
+    inactive). Docker and cAdvisor subtract only the inactive pages, which
+    counts such a model as spent. Not ``file``:
+    it includes tmpfs and shared memory, which sit on the anon lists. Absent
+    statistics, or a kernel without a key, subtract nothing for it; a present
+    but malformed file is a refusal.
     """
     stat_path = Path(directory) / "memory.stat"
     present, text = _read_bounded_ascii(stat_path, _CGROUP_STAT_MAX_BYTES,
                                         "cgroup memory statistics")
     if not present:
         return 0
-    key = "total_inactive_file" if v1 else "inactive_file"
-    values = []
+    prefix = "total_" if v1 else ""
+    values = {prefix + "inactive_file": [], prefix + "active_file": []}
     for line in _proc_lines(text, "cgroup memory statistics"):
         match = re.fullmatch(r"([A-Za-z0-9_]+) (\d+)", line)
         if match is None:
             raise CgroupFormatError(f"malformed cgroup memory statistics: {stat_path}")
-        if match.group(1) == key:
-            values.append(match.group(2))
-    if len(values) > 1:
-        raise CgroupFormatError(f"duplicate {key} in cgroup memory statistics: {stat_path}")
-    value = _parse_cgroup_counter(values[0]) if values else 0
-    if value is None:
-        raise CgroupFormatError(f"malformed {key} in cgroup memory statistics: {stat_path}")
-    return value
+        if match.group(1) in values:
+            values[match.group(1)].append(match.group(2))
+    cache = 0
+    for key, found in values.items():
+        if len(found) > 1:
+            raise CgroupFormatError(f"duplicate {key} in cgroup memory statistics: {stat_path}")
+        value = _parse_cgroup_counter(found[0]) if found else 0
+        if value is None:
+            raise CgroupFormatError(f"malformed {key} in cgroup memory statistics: {stat_path}")
+        cache += value
+    return cache
 
 
 def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
@@ -2165,8 +2195,8 @@ def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
     (v2 ``max``; v1's sentinel just below 2**63). Both files must be present
     and well-formed together: an incomplete pair or a malformed counter is a
     refusal, never something a looser ancestor may mask. Headroom is measured
-    against the working set, charged usage less reclaimable inactive file
-    cache, so a previous run's cached model pages do not read as spent budget.
+    against the working set, charged usage less reclaimable file cache
+    (inactive and active), so cached model pages do not read as spent budget.
     """
     directory = Path(directory)
     limit_path = directory / limit_name
@@ -2190,7 +2220,7 @@ def _cgroup_pair_remaining(directory, limit_name, current_name, v1=False):
         raise CgroupFormatError(f"malformed cgroup memory limit: {limit_path}")
     if v1 and limit >= _CGROUP_V1_UNLIMITED_MIN:
         return (True, None)
-    working_set = max(0, current - _cgroup_inactive_file(directory, v1=v1))
+    working_set = max(0, current - _cgroup_file_cache(directory, v1=v1))
     return (True, max(0, limit - working_set))
 
 
@@ -3402,7 +3432,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         return layer is not None and layer < chain_fit["n"]
     tensors_on_device = [tensor for tensor in info.get("dense_tensors", []) if on_device(tensor)]
     if partial:
-        released = sum(_vk_released_tensor_bytes(tensor, family_id, env_now) for tensor in tensors_on_device)
+        released = sum(_vk_released_tensor_bytes(tensor, family_id, env_now, info["path"])
+                       for tensor in tensors_on_device)
         vk_dense, vk_dense_why = ((False, None) if chain_fit["n"] == 0 else
                                   vk_dense_device_only(released, family_id, env_now, vulkan))
     else:
@@ -3411,7 +3442,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     dense_on_device = 0
     if vk_dense:
         dense_on_device = min(device_dense_bytes, sum(
-            _vk_released_tensor_bytes(tensor, family_id, env_now)
+            _vk_released_tensor_bytes(tensor, family_id, env_now, info["path"])
             for tensor in tensors_on_device))
         info = dict(info, dense_bytes=info["dense_bytes"] - dense_on_device)
     # On an integrated/software device the remaining device copy still consumes

@@ -40,6 +40,8 @@ LAYER_KINDS = frozenset((
     "self_attn.o_proj.weight",
     "self_attn.q_norm.weight",
     "self_attn.k_norm.weight",
+    # Flint (RecursiveSI/flint): a learned sink logit per attention head
+    "self_attn.softmax_offset",
     # MoE block: router, shared expert, its gate
     "mlp.gate.weight",
     "mlp.shared_expert.gate_proj.weight",
@@ -67,7 +69,9 @@ SKIP_PREFIXES = ()
 
 # The vision tower, converted since #1757: the same ViT in Qwen3.5/3.6/3.8, run by
 # the engine through qwen38_vision.h. Placed as ("vision", <name after visual.>).
-VISION_PREFIXES = ("model.visual.", "visual.")
+# "model.language_model.visual.": the same tower, as some finetune exports
+# (llmfan46/Qwen3.6-35B-A3B-uncensored-heretic) nest it under the language model's prefix.
+VISION_PREFIXES = ("model.visual.", "visual.", "model.language_model.visual.")
 
 _LAYER = re.compile(r"^layers\.(\d+)\.(.+)$")
 

@@ -67,6 +67,38 @@ except ImportError as exc:
     sys.exit(f"Missing dependencies: {exc}. Install: pip install torch safetensors")
 
 
+class _MMapShard:
+    """One .safetensors file read through a numpy memmap: only the bytes of the
+    tensor asked for are paged in, and each tensor comes back as an owned torch copy."""
+    _DT = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32, "F64": torch.float64,
+           "I64": torch.int64, "I32": torch.int32, "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8,
+           "BOOL": torch.bool, "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2}
+
+    def __init__(self, path):
+        import numpy as np
+        with open(path, "rb") as f:
+            hlen = struct.unpack("<Q", f.read(8))[0]
+            self.header = json.loads(f.read(hlen))
+        self.header.pop("__metadata__", None)
+        self.base = 8 + hlen
+        self.mm = np.memmap(path, dtype=np.uint8, mode="r")
+
+    def keys(self):
+        return list(self.header)
+
+    def get_tensor(self, name):
+        e = self.header[name]
+        a, b = e["data_offsets"]
+        raw = self.mm[self.base + a:self.base + b]
+        t = torch.frombuffer(bytearray(raw), dtype=self._DT[e["dtype"]])
+        return t.reshape(e["shape"])
+
+    def __exit__(self, *exc):
+        mm, self.mm = self.mm, None
+        if mm is not None and getattr(mm, "_mmap", None) is not None:
+            mm._mmap.close()
+
+
 def quantize_row(w: torch.Tensor, bits: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Row-wise symmetric quantization to `bits` (2..8). Storage is int8 regardless of
     bits (engine dequantizes q*scale); for bits<8 values are confined to a smaller range."""
@@ -549,6 +581,10 @@ def main():
     # each of those, so the defaults below branch on it. The dense Qwen3 (qwen3) is the
     # same layer with one MLP, loaded like the dense Qwen3.5's.
     plain_qwen3 = cfg_full.get("model_type") in ("qwen3_moe", "qwen3")
+    # Flint (RecursiveSI/flint): the Qwen3 MoE layer with a sink per attention head,
+    # sliding-window layers, layers without RoPE, dense layers in front (mlp_only_layers)
+    # and sigmoid routing beside an ungated shared expert (tools/make_flint_tiny.py).
+    flint = cfg_full.get("model_type") == "flint"
     layer_types = mcfg.get("layer_types")
     if layer_types is None:
         n = mcfg.get("num_hidden_layers", n_layers_weight)
@@ -604,9 +640,9 @@ def main():
         shard = wm[name]
         ensure_shard(shard)
         if shard not in shard_handles:
-            # torch backend returns a native torch tensor (bf16 works natively);
-            # numpy backend returns a bf16 numpy array that torch.from_numpy rejects.
-            shard_handles[shard] = safe_open_pt(local_shards[shard], framework="pt")
+            # A numpy memmap instead of safe_open(framework="pt"), whose torch storage hit an access violation
+            # on Windows for a 49.7 GB shard with 34 GB RAM (torch 2.7 and 2.14, safetensors 0.6 and 0.8).
+            shard_handles[shard] = _MMapShard(local_shards[shard])
         return shard_handles[shard].get_tensor(name).contiguous()
 
     def evict_layer(i):
@@ -740,7 +776,7 @@ def main():
                          if mcfg.get("num_experts") else int(mcfg["intermediate_size"])),
         "rms_eps": float(mcfg.get("rms_norm_eps", 1e-6)),
         "ebits": args.ebits,
-        "scoring_func": mcfg.get("scoring_func", "softmax"),
+        "scoring_func": mcfg.get("router_score_function" if flint else "scoring_func", "softmax"),
         "n_group": int(mcfg.get("n_group", 1)),
         "topk_group": int(mcfg.get("topk_group", 1)),
         "norm_topk_prob": bool(mcfg.get("norm_topk_prob", False)),
@@ -748,10 +784,19 @@ def main():
         "rope_theta": float((mcfg.get("rope_parameters") or {}).get(
             "rope_theta", mcfg.get("rope_theta", 10000000.0))),
         "mrope_section": (mcfg.get("rope_parameters") or {}).get("mrope_section", [16, 16, 16]),
-        "partial_rotary_factor": float(mcfg.get("partial_rotary_factor", 1.0 if plain_qwen3 else 0.25)),
+        "partial_rotary_factor": float(mcfg.get("partial_rotary_factor", 1.0 if plain_qwen3 or flint else 0.25)),
     }
-    if plain_qwen3:
+    if plain_qwen3 or flint:
         meta["zero_centered_norms"] = False
+    if flint:
+        # the layers config.layer_types calls sliding_attention see sliding_window rows,
+        # their own included; the layers listed in no_rope_layer_indices take no RoPE;
+        # mlp_only_layers carry one SwiGLU MLP of intermediate_size and no router
+        meta["sliding_window"] = int(mcfg.get("sliding_window") or 0)
+        meta["no_rope_layers"] = sorted(int(i) for i in mcfg.get("no_rope_layer_indices", []))
+        meta["mlp_only_layers"] = sorted(int(i) for i in mcfg.get("mlp_only_layers", []))
+        meta["dense_inter"] = int(mcfg.get("intermediate_size", 0))
+        meta["attn_sinks"] = True
     # derive head dims from first full-attention layer weights (authoritative).
     # Read from SOURCE (not local output) so this works even when layer 0 was
     # skipped during a resume and its local shard was already stream-deleted.
@@ -788,7 +833,7 @@ def main():
             meta["expert_down_gs"] = args.down_gs
         meta["head_dim"] = meta.get("k_head_dim", meta.get("q_head_dim", 256))
         meta["rope_dim"] = meta.get("qk_rope_head_dim", meta["head_dim"] // 4)
-        if plain_qwen3:
+        if plain_qwen3 or flint:
             # One position per token, so M-RoPE over sections that cover the whole
             # rotary half is ordinary 1D RoPE; the engine needs the sections to add up.
             half = int(meta["rope_dim"] * meta["partial_rotary_factor"]) // 2

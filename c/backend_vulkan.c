@@ -7,6 +7,7 @@
 //
 // M2 scope: correctness + a standalone GPU-vs-CPU test harness. Synchronous
 // submit/wait per call; async queues and zero-copy import come in M4.
+#include <math.h>
 #include "backend_vulkan.h"
 #include "blockdec_host.h"           /* the block formats' sizes and table (blockdec_table.h) */
 #include "vk_alloc.h"
@@ -277,6 +278,7 @@ struct ColiVkTensor {
     struct ColiVkTensor *imp_next;   /* the live imports, freed at shutdown */
     size_t wcap, scap;     /* the bytes its two ranges hold (tensor_alloc_pad: room for a bigger format) */
     size_t acct;           /* what tensor_alloc added to the pool's counters, taken back at the release */
+    uint8_t wide;          /* a scale times the format's largest code passes f16 (scales_wide): off the cooperative-matrix GEMMs, which hold the weights in f16 */
 };
 
 /* ---- memory placement without Resizable BAR (docs/vulkan.md) ------------------------
@@ -371,8 +373,10 @@ typedef struct { int bm, bn, wm, wn, bk; } VkCoopTile;
 
 /* Persistent device-side KV latent/rope cache for one layer (MLA attention).
  * Host appends rows as tokens decode (absolute-position indexing); the absorb
- * kernel reads them in place. Allocated once at max_t rows, like the CUDA
- * kv_dev shadow. */
+ * kernel reads them in place. It grows with the conversation (coli_vk_kv_grow),
+ * as the dense chain's mirror does: allocated at max_t rows, a 20-token chat with
+ * the gateway's 131072 tokens of context asked GLM-5.3's 79 layers for 23.6 GB on
+ * a 24 GB card, and every layer past the first ~40 failed at every token (#2314). */
 #define VK_KV_LAYERS 160
 typedef struct {
     VkBuffer bl, br; VkDeviceMemory ml, mr; void *pl, *pr;
@@ -498,7 +502,11 @@ struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; i
  * shaders size their work by gl_SubgroupSize and gl_SubgroupID; an Intel Iris Xe
  * (8 to 32) ran chain_gemv and chain_gemv2 at another width than the one they read,
  * and every decode GEMV of the chain came out wrong. 0: a device with one size (NVIDIA,
- * Lavapipe), no control, or COLI_VK_SUBGROUP=0 (the driver's choice, as before). */
+ * Lavapipe), no control, or COLI_VK_SUBGROUP=0 (the driver's choice, as before).
+ * COLI_VK_SUBGROUP=n pins n instead (every pipeline that takes this size: the chain's,
+ * build_pipeline's and the expert batch's), a power of two the device allows: Mesa's ANV
+ * (Intel Meteor Lake, Mesa 26.2) took over 38 minutes to compile chain_moe.spv at the
+ * reported 32 and 72-195 s at 16, where test_vk_chain passes. */
 static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
 #ifdef VK_EXT_subgroup_size_control
     const char *e = getenv("COLI_VK_SUBGROUP");
@@ -515,6 +523,14 @@ static int vk_pin_sg(VkPhysicalDevice phys, int has_ext) {
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
     vkGetPhysicalDeviceProperties2(phys, &p2);
     uint32_t n = sg.subgroupSize;
+    if (e && *e) {
+        long want = strtol(e, NULL, 10);
+        if (want >= (long)sp.minSubgroupSize && want <= (long)sp.maxSubgroupSize && !(want & (want - 1)))
+            n = (uint32_t)want;
+        else
+            fprintf(stderr, "[VK] COLI_VK_SUBGROUP=%s: not a size this device allows (%u to %u); pinning %u\n",
+                    e, sp.minSubgroupSize, sp.maxSubgroupSize, n);
+    }
     if (!f.subgroupSizeControl || !(sp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
         sp.minSubgroupSize >= sp.maxSubgroupSize || n < sp.minSubgroupSize || n > sp.maxSubgroupSize || (n & (n - 1)))
         return 0;
@@ -637,27 +653,34 @@ static void up_imp_release(VkUp *u, int s) {
     u->nimp[s] = 0;
 }
 /* The host image a tier tensor is filled in (coli_vk_tier_tensor, staged uploads): aligned
- * and rounded to the device's import alignment, so up_import can copy from it in place. */
+ * and rounded to the device's import alignment, so up_import can copy from it in place.
+ * Off Windows it is aligned by hand inside a calloc'd block, whose address sits just before
+ * the image, as the path without imports allocates: posix_memalign + memset kept ~5 GiB of
+ * freed images in glibc's arenas over a prompt (pure Vulkan, V4 Flash REAP: anon 45.4 GiB
+ * against 40.3 this way), past what the host pool's sizing leaves the engine. */
 static uint8_t *up_img_alloc(int dev, size_t bytes, uint8_t *aligned) {
     size_t al = g_up[dev].imp_align;
     *aligned = al != 0;
     if (!al) return calloc(1, bytes);
-    void *p = NULL;
     size_t sz = (bytes + al - 1) / al * al;
 #ifdef _WIN32
-    p = _aligned_malloc(sz, al);
-#else
-    if (posix_memalign(&p, al, sz)) p = NULL;
-#endif
+    void *p = _aligned_malloc(sz, al);
     if (p) memset(p, 0, sz);
     return p;
+#else
+    uint8_t *raw = calloc(1, sz + al + sizeof(void *));
+    if (!raw) return NULL;
+    uint8_t *p = (uint8_t *)(((uintptr_t)raw + sizeof(void *) + al - 1) / al * al);
+    memcpy(p - sizeof(void *), &raw, sizeof raw);
+    return p;
+#endif
 }
 static void up_img_free(uint8_t *p, int aligned) {
     if (!p) return;
 #ifdef _WIN32
     if (aligned) { _aligned_free(p); return; }
 #else
-    (void)aligned;
+    if (aligned) { void *raw; memcpy(&raw, p - sizeof(void *), sizeof raw); free(raw); return; }
 #endif
     free(p);
 }
@@ -1171,7 +1194,22 @@ int coli_vk_init(const char *spv_path) {
     {
         const char *e = getenv("COLI_VK_COOP");
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
-        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2 && !(e && *e == '0')) {
+        /* AMD's own driver (Windows, 32.0.32015.7029) crashed inside its compiler on a
+         * Radeon 780M once the cooperative-matrix features were on, before the engine was
+         * ready, with subgroups of 64 and of 32 alike (#2289): a crash in the driver no
+         * fallback here can catch, so the default leaves them off on that driver.
+         * RADV runs them on the same chip (measured). COLI_VK_COOP=1 tries them. */
+        int amd_own = 0;
+        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2) {
+            VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 dp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
+            vkGetPhysicalDeviceProperties2(G.phys, &dp2);
+            amd_own = dp.driverID == VK_DRIVER_ID_AMD_PROPRIETARY && !(e && *e == '1');
+            if (amd_own && !(e && *e == '0'))
+                fprintf(stderr, "[VK] cooperative matrix off on AMD's own driver (%s %s: it crashed compiling the shader "
+                                "on a Radeon 780M, #2289); COLI_VK_COOP=1 tries it\n", dp.driverName, dp.driverInfo);
+        }
+        if (has_cm && has_ssc && pp.apiVersion >= VK_API_VERSION_1_2 && !(e && *e == '0') && !amd_own) {
             VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &v12f};
             vkGetPhysicalDeviceFeatures2(G.phys, &f2);
             VkPhysicalDeviceSubgroupSizeControlPropertiesEXT ssp = {
@@ -1953,6 +1991,17 @@ static int fmt_uploadable(int fmt, int gs) {
            ((fmt == 12 || fmt == 13) && gs >= 4 && gs % 4 == 0);           /* fp8 / int8: 4 per word */
 }
 
+/* The cooperative-matrix GEMMs (qmatmul_coop.comp, chain_gemm.comp) hold the dequantised weights, code
+ * times scale, in f16. A matrix with a scale past 65504 / (the format's largest code) would turn to inf
+ * there and its output column to NaN; GLM-5.3 Flash's layer-0 v_proj has 148 weights of 1e20 to 1e33
+ * (int4 g64 scales to 1e34), which the fp32 GEMMs and the CPU take in stride. Such a matrix stays on them. */
+static int scales_wide(int fmt, const float *scales, size_t n) {
+    if (!scales || !(fmt == 1 || fmt == 2 || fmt == 4 || fmt == 5 || fmt == 7 || fmt == 12)) return 0;
+    /* largest |code|: int8 127, fp8 e4m3 448, int4 8 (also bounds int3 and MXFP4) */
+    float lim = 65504.0f / (fmt == 12 ? 448.0f : fmt == 1 ? 127.0f : 8.0f);
+    for (size_t i = 0; i < n; i++) if (!(fabsf(scales[i]) <= lim)) return 1;   /* also a NaN */
+    return 0;
+}
 static void tensor_release(ColiVkTensor *t);
 static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weights, const float *scales,
                               int fmt, int I, int O, int gs) {
@@ -1961,6 +2010,7 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
     if (pool_staged(P)) {   /* staged: the rows and the scales through the uploader */
         ColiVkTensor *t = tensor_alloc(P, fmt, I, O, gs, NULL, NULL);
         if (!t) return 0;
+        t->wide = scales_wide(fmt, scales, scale_floats(fmt, I, O, gs));
         static const float one = 1.0f;   /* float weights: no scales */
         UpRows rows = {weights, cpu_row_bytes(fmt, I), (size_t)t->rowWords * 4};
         size_t sb = scale_floats(fmt, I, O, gs) * sizeof(float);
@@ -1984,6 +2034,7 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
     void *wptr, *sptr;
     ColiVkTensor *t = tensor_alloc(P, fmt, I, O, gs, &wptr, &sptr);
     if (!t) return 0;
+    t->wide = scales_wide(fmt, scales, scale_floats(fmt, I, O, gs));
     size_t stride = (size_t)t->rowWords * 4;         // padded row bytes
     size_t cpu_rb = cpu_row_bytes(fmt, I);
     for (int o = 0; o < O; o++)                        // copy row-by-row into padded layout
@@ -2260,8 +2311,8 @@ static void vk_prof_paths(void) {
  * boundaries on its staged steps (one group scale per step). */
 static int coop_fmt(const ColiVkTensor *t) {
     int gs = t->fmt == 5 ? 64 : t->gs;
-    return t->fmt == 1 || t->fmt == 2 ||
-           ((t->fmt == 4 || t->fmt == 5 || t->fmt == 7 || t->fmt == 12) && gs % G.coop_t[0].bk == 0);
+    return !t->wide && (t->fmt == 1 || t->fmt == 2 ||
+           ((t->fmt == 4 || t->fmt == 5 || t->fmt == 7 || t->fmt == 12) && gs % G.coop_t[0].bk == 0));
 }
 /* Its x upload: the rows, then their powers of two rs[s] = 2^(15-e) with
  * max|x[s,:]| < 2^e, so a scaled row stays under 2^15 (fp16 max 65504) and its hi/lo
@@ -2629,9 +2680,19 @@ int coli_vk_chain_decide(const char *engine, int tier_on, int igpu) {
     return on;
 }
 
+/* #2289: a COLI_VULKAN set in another console left a Vulkan build on the CPU without a
+ * word. The build says the device stays unused, and why, once a process. */
+void coli_vk_say_unused(const char *engine) {
+    static int said;
+    const char *on = getenv("COLI_VULKAN");
+    if (said++) return;
+    fprintf(stderr, "[VK] %s: %s: the Vulkan device stays unused (COLI_VULKAN=1 uses it)\n", engine,
+            on && *on ? "COLI_VULKAN=0" : "COLI_VULKAN is not set");
+}
+
 int coli_vk_init_env_tier(const char *engine, int tier_on) {
     const char *on = getenv("COLI_VULKAN");
-    if (!on || !atoi(on)) return 0;
+    if (!on || !atoi(on)) { coli_vk_say_unused(engine); return 0; }
     char buf[1024];
     const char *spv = coli_vk_shader_path(buf, sizeof buf);
     int ok = coli_vk_init(spv) && coli_vk_available();
@@ -3344,10 +3405,7 @@ static int alloc_dev(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem) {
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 }
 
-int coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd) {
-    if (!G.ready || layer < 0 || layer >= VK_KV_LAYERS || max_rows < 1 || K < 1 || Rd < 1) return 0;
-    VkKvLayer *v = &G.kv[layer];
-    if (v->bl) return v->rows >= max_rows && v->K == K && v->R == Rd;  /* resize goes through coli_vk_kv_reset */
+static int kv_layer_alloc(VkKvLayer *v, int max_rows, int K, int Rd) {
     float p0 = G.prio; G.prio = 1.0f;            /* KV mirror rides every attention submit */
     int ok1, ok;
     if (g_up[0].on) {   /* staged: device-local, the rows through PW */
@@ -3364,6 +3422,43 @@ int coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd) {
     }
     v->rows = max_rows; v->K = K; v->R = Rd;
     return 1;
+}
+static void kv_layer_free(VkKvLayer *v) {
+    if (v->bl && G.ready) {   /* dead device: leak GPU handles like coli_vk_tensor_free */
+        vkDestroyBuffer(G.dev, v->bl, NULL); vkFreeMemory(G.dev, v->ml, NULL);
+        vkDestroyBuffer(G.dev, v->br, NULL); vkFreeMemory(G.dev, v->mr, NULL);
+    }
+    memset(v, 0, sizeof(*v));
+}
+int coli_vk_kv_ensure(int layer, int max_rows, int K, int Rd) {
+    if (!G.ready || layer < 0 || layer >= VK_KV_LAYERS || max_rows < 1 || K < 1 || Rd < 1) return 0;
+    VkKvLayer *v = &G.kv[layer];
+    if (v->bl) return v->rows >= max_rows && v->K == K && v->R == Rd;  /* resize goes through coli_vk_kv_reset */
+    return kv_layer_alloc(v, max_rows, K, Rd);
+}
+/* The least rows a layer's mirror could not get (0: none yet): no mirror that large is
+ * asked for again until coli_vk_kv_reset, so a full device costs one refusal, not one
+ * per layer and token. */
+static int g_kv_refused;
+int coli_vk_kv_grow(int layer, int need, int max_rows, int K, int Rd) {
+    if (!G.ready || layer < 0 || layer >= VK_KV_LAYERS || need < 1 || max_rows < need || K < 1 || Rd < 1) return 0;
+    VkKvLayer *v = &G.kv[layer];
+    if (v->bl && v->rows >= need && v->K == K && v->R == Rd) return 1;
+    int cap = 256;
+    while (cap < need) cap *= 2;
+    if (cap > max_rows) cap = max_rows;
+    if (g_kv_refused && cap >= g_kv_refused) return 0;
+    /* the old rows go first (their pending copies with them): the new size needs the room */
+    if (v->bl) { if (PW.n && !pw_flush()) return 0; kv_layer_free(v); }
+    PW.last1[layer] = 0;
+    if (!kv_layer_alloc(v, cap, K, Rd)) {
+        if (!g_kv_refused)
+            fprintf(stderr, "[VK] attention KV mirror: no room on the device for %d rows a layer (layer %d); a layer "
+                            "whose rows do not fit computes its attention on the CPU\n", cap, layer);
+        g_kv_refused = cap;
+        return 0;
+    }
+    return 2;
 }
 
 /* Mirror one host cache row into the device copy (write-combined memory: the CPU
@@ -3387,15 +3482,8 @@ int coli_vk_kv_row(int layer, int pos, const float *L, const float *R) {
 /* Drop all per-layer KV device caches (cache resize in kv_alloc). */
 void coli_vk_kv_reset(void) {
     if (PW.n) pw_flush();   /* nothing pending may name a buffer that goes */
-    for (int i = 0; i < VK_KV_LAYERS; i++) {
-        VkKvLayer *v = &G.kv[i];
-        if (!v->bl) continue;
-        if (G.ready) {   /* dead device: leak GPU handles like coli_vk_tensor_free */
-            vkDestroyBuffer(G.dev, v->bl, NULL); vkFreeMemory(G.dev, v->ml, NULL);
-            vkDestroyBuffer(G.dev, v->br, NULL); vkFreeMemory(G.dev, v->mr, NULL);
-        }
-        memset(v, 0, sizeof(*v));
-    }
+    for (int i = 0; i < VK_KV_LAYERS; i++) if (G.kv[i].bl) kv_layer_free(&G.kv[i]);
+    g_kv_refused = 0;
 }
 
 /* Decode MLA absorption core for S causal query rows of one sequence, one submit:
@@ -3807,8 +3895,10 @@ void coli_vk_pool_stats(int which, ColiVkPoolStats *st) {
 static void tier_pool_limit(VkWPool *P, size_t bytes) {
     pthread_mutex_lock(&P->mx);
     P->p.limit = bytes;
-    /* blocks no larger than the budget, so a small budget is not one refused block */
-    size_t bb = coli_vk_block_bytes_dev(P->dev, VK_WBLOCK);
+    /* blocks no larger than the budget, so a small budget is not one refused block; the host
+     * pool's are system RAM, which COLI_VK_DEVICE_CAP_MB does not shrink (under the cap its
+     * 2 MiB blocks held one expert each: Flint's 18.5 GB took 24.5 GiB) */
+    size_t bb = P->host ? VK_WBLOCK : coli_vk_block_bytes_dev(P->dev, VK_WBLOCK);
     P->p.block_bytes = bytes && bytes < bb ? ((bytes + 4095) & ~(size_t)4095) : bb;
     /* the empty block the pool keeps as a spare (vka_free) goes too: a tier started
      * again after a shutdown would otherwise fill it past its new, smaller budget */
@@ -3818,7 +3908,36 @@ static void tier_pool_limit(VkWPool *P, size_t bytes) {
 }
 void coli_vk_tier_pool_limit(size_t bytes) { tier_pool_limit(&g_tpool, bytes); }
 void coli_vk_tier_pool_limit_dev(int dev, size_t bytes) { tier_pool_limit(dev == 2 ? &g_hpool : dev == 1 ? &g_tpool2 : &g_tpool, bytes); }
+int coli_vk_tier_pool_blocks(uint64_t *bytes, int max) {
+    VkWPool *P = &g_tpool;
+    pthread_mutex_lock(&P->mx);
+    const int nb = P->p.nb;
+    for (int k = 0; bytes && k < nb && k < max; k++) bytes[k] = P->p.b[k].present ? P->p.b[k].cap : 0;
+    pthread_mutex_unlock(&P->mx);
+    return nb;
+}
 int coli_vk_tier_host_pool(void) { return G.ready && G.has_bda && G.memtype_sys >= 0; }
+/* The room the driver leaves in the system-RAM heap the host pool lives in (G.memtype_sys's):
+ * its budget less its usage (VK_EXT_memory_budget), else the heap's size; 0 when unknown. The
+ * heap is not all the RAM: NVIDIA's on Linux is three quarters of it (46.9 of 62.6 GiB on an
+ * RTX PRO 4000's host), on Windows about half, and blocks past it are refused (#2314). */
+size_t coli_vk_tier_host_heap_room(void) {
+    if (!G.ready || !G.phys || G.memtype_sys < 0) return 0;
+    const char *t = getenv("COLI_VK_TIER_HOST_HEAP_GB");   /* tests: the room a driver would leave */
+    if (t && *t && atof(t) > 0) return (size_t)(atof(t) * 1073741824.0);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
+    uint32_t hi = mp.memoryTypes[G.memtype_sys].heapIndex;
+#ifdef VK_EXT_memory_budget
+    if (G.has_budget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT bud = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &bud};
+        vkGetPhysicalDeviceMemoryProperties2(G.phys, &mp2);
+        if (bud.heapBudget[hi]) return bud.heapBudget[hi] > bud.heapUsage[hi] ? (size_t)(bud.heapBudget[hi] - bud.heapUsage[hi]) : 0;
+    }
+#endif
+    return (size_t)mp.memoryHeaps[hi].size;
+}
 void coli_vk_tier_extra_pool_limit(size_t bytes) { tier_pool_limit(&g_xpool, bytes); }
 
 size_t coli_vk_tensor_bytes(const ColiVkTensor *t) { return t ? t->wbytes : 0; }
@@ -3907,6 +4026,21 @@ struct ColiVkExpert {
 /* An expert's three tensors (gate, up, down). */
 void coli_vk_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d) {
     *g = e ? e->g : NULL; *u = e ? e->u : NULL; *d = e ? e->d : NULL;
+}
+int coli_vk_xb_expert_blocks(const ColiVkExpert *e, int *blk, int max) {
+    int n = 0;
+    const ColiVkTensor *t[3] = {e ? e->g : NULL, e ? e->u : NULL, e ? e->d : NULL};
+    for (int k = 0; k < 3; k++) {
+        if (!t[k] || t[k]->pool != &g_tpool) continue;
+        const VkaRange r[2] = {t[k]->wr, t[k]->sr};
+        for (int j = 0; j < 2; j++) {
+            if (!r[j].len) continue;
+            int seen = 0;
+            for (int q = 0; q < n; q++) seen |= blk[q] == r[j].block;
+            if (!seen && n < max) blk[n++] = r[j].block;
+        }
+    }
+    return n;
 }
 typedef struct { VkBuffer buf; VkDeviceMemory mem; void *ptr; size_t region; } XbBuf;
 typedef struct XbCtx {
@@ -6049,7 +6183,7 @@ int coli_vk_core(ColiVkCore *o) {
 int coli_vk_tensor_info(const ColiVkTensor *t, ColiVkTensorInfo *o) {
     if (!t || !o || t->dev != 0) return 0;
     o->wbuf = (void *)t->wbuf; o->sbuf = (void *)t->sbuf;
-    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs;
+    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs; o->wide = t->wide;
     return 1;
 }
 /* A fence the chain waited on failed: the device is gone, everyone falls back. */
@@ -6082,7 +6216,7 @@ int coli_vk_queue_submit_dev(int d, void *queue, const void *submit_info, void *
 int coli_vk_tensor_info_dev(const ColiVkTensor *t, ColiVkTensorInfo *o, int *dev) {
     if (!t || !o || t->dev < 0 || t->dev > 1) return 0;
     o->wbuf = (void *)t->wbuf; o->sbuf = (void *)t->sbuf;
-    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs;
+    o->fmt = t->fmt; o->I = t->I; o->O = t->O; o->rowWords = t->rowWords; o->gs = t->gs; o->wide = t->wide;
     if (dev) *dev = t->dev;
     return 1;
 }
@@ -6592,6 +6726,7 @@ static int run_expert_group(int fmt, int D, int I, int K) {
  * qabs = sum_d q[d]*deq(row rbase+d)*ws, scores over cache rows [st0, T-S+s],
  * softmax, weighted latent, value-row projection. */
 static int g_absorb_rewind;   /* write every row twice, first garbage: a rewound mirror */
+static int g_absorb_grow;     /* the mirror grown a row at a time (coli_vk_kv_grow), as colibri's decode does */
 static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0, int T, int layer) {
     size_t rb = ref_rowbytes(fmt, K);
     int O = H * (Q + V), ngK = (K + 63) / 64;
@@ -6606,14 +6741,24 @@ static int run_absorb(int fmt, int S, int H, int Q, int R, int V, int K, int st0
     for (int i = 0; i < T * K; i++) L[i] = (rand() % 200 - 100) / 100.0f;
     for (int i = 0; i < T * R; i++) Rr[i] = (rand() % 200 - 100) / 100.0f;
     float scale = 0.13f;
-    if (!coli_vk_kv_ensure(layer, T, K, R)) { printf("kv_ensure failed\n"); return 1; }
+    if (g_absorb_grow) {   /* 256 rows, then 512, 1024 and T: each new buffer filled again from row 0 */
+        int valid = 0, grown = 0;
+        for (int t = 0; t < T; t++) {
+            int g = coli_vk_kv_grow(layer, t + 1, T, K, R);
+            if (!g) { printf("kv_grow failed at row %d\n", t); return 1; }
+            if (g == 2) { valid = 0; grown++; }
+            for (; valid <= t; valid++)
+                if (!coli_vk_kv_row(layer, valid, L + (size_t)valid * K, Rr + (size_t)valid * R)) { printf("kv_row failed\n"); return 1; }
+        }
+        if (grown != 4) { printf("kv_grow: %d buffers for %d rows, not 4\n", grown, T); return 1; }
+    } else if (!coli_vk_kv_ensure(layer, T, K, R)) { printf("kv_ensure failed\n"); return 1; }
     if (g_absorb_rewind) {   /* garbage rows, then the real ones from the middle and from 0 */
         for (int t = 0; t < T; t++)
             if (!coli_vk_kv_row(layer, t, Rr, L)) { printf("kv_row failed\n"); return 1; }
         for (int t = T / 2; t < T; t++)
             if (!coli_vk_kv_row(layer, t, L + (size_t)t * K, Rr + (size_t)t * R)) { printf("kv_row failed\n"); return 1; }
     }
-    for (int t = 0; t < T; t++)
+    for (int t = 0; t < T && !g_absorb_grow; t++)
         if (!coli_vk_kv_row(layer, t, L + (size_t)t * K, Rr + (size_t)t * R)) { printf("kv_row failed\n"); return 1; }
     ColiVkTensor *kvb = NULL;
     if (!coli_vk_attention_absorb(&kvb, w, ws, fmt, g_ref_gs, cg, q, layer, S, H, Q, R, V, K, st0, T, scale)) {
@@ -7435,6 +7580,11 @@ int main(int argc, char **argv) {
      * cases above. CI runs this on Lavapipe, where the benches below say nothing and
      * take most of the time. */
     if (getenv("COLI_VK_TEST_MATMUL_ONLY") && atoi(getenv("COLI_VK_TEST_MATMUL_ONLY"))) {
+        if (G.pipe_att) {   /* the absorb core's KV mirror growing with the conversation (#2314), staged and mapped */
+            g_absorb_grow = 1;
+            bad |= run_absorb(2, 1, 64, 192, 64, 256, 512, 0, 1500, 10);
+            g_absorb_grow = 0;
+        }
         printf("outputs digest %016llx\n", (unsigned long long)g_digest);
         bad |= run_late_cases();
         printf(bad ? "FAIL\n" : "PASS\n");
@@ -7555,6 +7705,9 @@ int main(int argc, char **argv) {
         g_absorb_rewind = 1;   /* every row written twice, out of order: a rewound mirror */
         bad |= run_absorb(2, 1, 64, 192, 64, 256, 512, 0, 300, 9);
         g_absorb_rewind = 0;
+        g_absorb_grow = 1;     /* a mirror that grows with the conversation (#2314) */
+        bad |= run_absorb(2, 1, 64, 192, 64, 256, 512, 0, 1500, 10);
+        g_absorb_grow = 0;
     }
     printf("outputs digest %016llx\n", (unsigned long long)g_digest);
     bad |= run_late_cases();
